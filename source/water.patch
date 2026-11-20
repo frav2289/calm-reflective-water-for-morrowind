@@ -1,0 +1,414 @@
+diff --git c/components/rtxvulkan/shaders/lib/sea.glsl w/components/rtxvulkan/shaders/lib/sea.glsl
+index 0a198a8c..9a11e43a 100644
+--- c/components/rtxvulkan/shaders/lib/sea.glsl
++++ w/components/rtxvulkan/shaders/lib/sea.glsl
+@@ -20,8 +20,65 @@
+ #include "turns.glsl"
+ 
+ /// How far refraction deflects a ray, per unit of surface slope.
++// Stretch the swell horizontally while retaining its surface slopes.
++const float SWELL_WAVELENGTH_SCALE = 1.0;
++const float WATER_MOTION_STRENGTH = 0.1;
++
+ const float WATER_REFRACTION_BEND = 1.0 - 1.0 / WATER_IOR;
+ 
++// Rain and lily edges use the same capillary waveform. The lily footprint fixes
++// its phase in world space and supplies its own envelope along the pad edge.
++float capillaryCrest(float signedDistance)
++{
++    return cos((TAU / RAIN_RING_LENGTH) * signedDistance);
++}
++
++#extension GL_EXT_ray_tracing_position_fetch : require
++vec2 stationaryPadSlope(vec3 point, float footprint, out float contactShade)
++{
++    contactShade = 0.0;
++    float detail = resolved(RAIN_RING_LENGTH, footprint);
++    if (detail <= 0.0 || abs(point.z) > 8.0)
++        return vec2(0.0);
++
++    rayQueryEXT probe;
++    rayQueryInitializeEXT(probe, sceneTop, gl_RayFlagsNoOpaqueEXT, MASK_STATIC,
++        point - vec3(0, 0, 1250), 0.0, vec3(0, 0, -1), 1000.0);
++    vec2 slope = vec2(0.0);
++    while (rayQueryProceedEXT(probe))
++    {
++        if (rayQueryGetIntersectionTypeEXT(probe, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
++            continue;
++        vec3 corners[3];
++        rayQueryGetIntersectionTriangleVertexPositionsEXT(probe, false, corners);
++        if (all(lessThan(abs(vec3(corners[0].z, corners[1].z, corners[2].z)
++            - vec3(-1025.375)), vec3(0.001))))
++        {
++            vec2 uv = rayQueryGetIntersectionBarycentricsEXT(probe, false);
++            vec2 local = corners[0].xy * (1.0 - uv.x - uv.y) + corners[1].xy * uv.x + corners[2].xy * uv.y;
++            float outer = max(length(corners[0].xy), max(length(corners[1].xy), length(corners[2].xy)));
++            float radius = 1.42 * length(local) / max(outer, 0.001);
++            float shade = 1.0 - smoothstep(0.5, 1.42, radius);
++            contactShade = max(contactShade, 0.90 * shade * detail);
++            continue;
++        }
++        // Local depth identifies the buried footprint even if alpha state is optimized away.
++        if (any(greaterThan(abs(vec3(corners[0].z, corners[1].z, corners[2].z)
++            - vec3(-1024.375)), vec3(0.001))))
++            continue;
++        mat4x3 toWorld = rayQueryGetIntersectionObjectToWorldEXT(probe, false);
++        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(probe, false);
++        bool first = (rayQueryGetIntersectionPrimitiveIndexEXT(probe, false) & 1u) == 0u;
++        vec2 outward = (toWorld * vec4(corners[1] - corners[first ? 0 : 2], 0.0)).xy;
++        float width = max(length(outward), 0.001);
++        float across = first ? bary.x + bary.y : bary.x;
++        float envelope = (1.0 - smoothstep(0.35, 1.0, across)) * smoothstep(0.4, 3.0, width);
++        slope += (outward / width) * (0.35 * detail * RAIN_RING_STEEPNESS * envelope
++            * capillaryCrest(across * width));
++    }
++    return slope;
++}
++
+ /// What the rain adds to the water it lands on, as a slope beside the wave field's.
+ ///
+ /// **Rings from a lattice of impacts, the same trick the drops themselves use.** Each cell of the water
+@@ -45,7 +102,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+ 
+     // Squared, because `detail` scales a slope and what `lost` accumulates is a mean square of one.
+     const float dropped = 1.0 - detail * detail;
+-    const float wavenumber = TAU / RAIN_RING_LENGTH;
++
+ 
+     vec2 slope = vec2(0.0);
+     const ivec2 base = ivec2(floor(at / RAIN_RING_CELL));
+@@ -65,7 +122,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+ 
+             // Where this impact is in its own life, which each cell keeps its own phase of so the
+             // whole surface does not ring at once.
+-            const float age = fract(turnsAt(1.0 / RAIN_RING_LIFE, frame.mWaterTime) + offset) * RAIN_RING_LIFE;
++            const float age = fract(turnsAt(WATER_ANIMATION_SPEED / RAIN_RING_LIFE, frame.mWaterTime) + offset) * RAIN_RING_LIFE;
+ 
+             const vec2 away = at - fell;
+             const float distance = length(away);
+@@ -84,7 +141,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+             if (!(detail > 0.0))
+                 continue;
+ 
+-            slope += away / max(distance, 1.0e-4) * (detail * steepness * cos(wavenumber * (distance - front)));
++            slope += away / max(distance, 1.0e-4) * (detail * steepness * capillaryCrest(distance - front));
+         }
+ 
+     return slope;
+@@ -123,7 +180,7 @@ vec3 seaWorldHessian(vec3 hessian)
+ /// Where on a tile a world position falls. Wrapped by the sampler, because a tile repeats.
+ vec2 waveCoordinate(uint cascade, vec2 at)
+ {
+-    return seaLocal(at) / frame.mWaveExtent[cascade];
++    return seaLocal(at) / (frame.mWaveExtent[cascade] * SWELL_WAVELENGTH_SCALE);
+ }
+ 
+ /// What share of the sea's whole curvature a tile still carries at this level of its chain.
+@@ -156,7 +213,7 @@ float resolvedShare(uint cascade, float level)
+ /// texel has nothing further to be shown.
+ float waveLevel(uint cascade, float footprint)
+ {
+-    return max(log2(footprint / frame.mWaveTexel[cascade]) + frame.mLevelBias, 0.0);
++    return max(log2(footprint / (frame.mWaveTexel[cascade] * SWELL_WAVELENGTH_SCALE)) + frame.mLevelBias, 0.0);
+ }
+ 
+ /// Where `at` lands on the ripple field, in its texture's coordinates, or nothing where the field is nought
+@@ -213,6 +270,7 @@ vec3 rippleHessian(vec2 at, float footprint)
+ /// the surface is not.
+ struct WaterSurface
+ {
++    float mPadShade;
+     /// Unit, from the gradient of the height field.
+     vec3 mNormal;
+ 
+@@ -227,8 +285,9 @@ struct WaterSurface
+ /// **Both come out of one fetch**, which is what the moments were composed into that texture for: `E[f^2] -
+ /// E[f]^2` off one level of one chain is the variance that level averaged away, where a filter applied here
+ /// would be a second opinion about the same field.
+-WaterSurface waterSurfaceAt(vec2 at, float footprint)
++WaterSurface waterSurfaceAt(vec3 waterPoint, float footprint)
+ {
++    vec2 at = waterPoint.xy;
+     WaterSurface surface;
+     surface.mLostSlope = 0.0;
+ 
+@@ -259,6 +318,7 @@ WaterSurface waterSurfaceAt(vec2 at, float footprint)
+     // joins the spectrum's, because a cone that cannot resolve a ring lost real slope either way.
+     float rainLost;
+     slope += rainSlope(at, footprint, rainLost);
++    slope += stationaryPadSlope(waterPoint, footprint, surface.mPadShade);
+ 
+     surface.mLostSlope += rainLost;
+ 
+@@ -268,7 +328,8 @@ WaterSurface waterSurfaceAt(vec2 at, float footprint)
+ 
+     surface.mLostSlope += rippleLost;
+ 
+-    surface.mNormal = normalize(vec3(-slope, 1.0));
++    surface.mLostSlope *= WATER_MOTION_STRENGTH * WATER_MOTION_STRENGTH;
++    surface.mNormal = normalize(vec3(-slope * WATER_MOTION_STRENGTH, 1.0));
+     return surface;
+ }
+ 
+@@ -303,7 +364,7 @@ float caustic(vec2 at, float depth, float footprint)
+     // which grows as the *square root* of the depth once the map has folded — that is Snyder and Dera's
+     // other half, and it is a property of branching rather than of any blur. The root is what makes the
+     // change start in the shallows, where a linear term is still under one texel and shows nothing at all.
+-    const float blurred = depth * (WATER_CAUSTIC_SPREAD + WATER_REFRACTION_BEND * frame.mWaveSlope);
++    const float blurred = depth * (WATER_CAUSTIC_SPREAD + WATER_REFRACTION_BEND * frame.mWaveSlope * WATER_MOTION_STRENGTH);
+     const float branched = WATER_CAUSTIC_GRAIN * sqrt(depth / WATER_CAUSTIC_FOCUS);
+     const float widened = max(footprint, max(blurred, branched));
+ 
+@@ -318,7 +379,7 @@ float caustic(vec2 at, float depth, float footprint)
+ 
+     // A wake's rings are a Hessian like any swell's, read at the same width, but laid in the world's frame:
+     // the tiles' sum is turned into it first, as their slope is.
+-    hessian = seaWorldHessian(hessian) + rippleHessian(at, widened);
++    hessian = seaWorldHessian(hessian) / SWELL_WAVELENGTH_SCALE + rippleHessian(at, widened);
+ 
+     // One determinant and not a ratio of two, because this surface is not displaced: the quad stays flat
+     // and only its normal moves, so the patch of surface the light left is the patch of parameter space it
+@@ -328,7 +389,7 @@ float caustic(vec2 at, float depth, float footprint)
+     // focus, which is where a lens is at its strongest and where one Jacobian stops describing what
+     // is behind it. The fade below carries the depth from there on.
+     const float toward = WATER_CAUSTIC_FOLD * min(depth / WATER_CAUSTIC_FOCUS, 1.0);
+-    const float bend = toward * inversesqrt(max(frame.mWaveCurvature, 1.0e-12));
++    const float bend = toward * WATER_MOTION_STRENGTH * inversesqrt(max(frame.mWaveCurvature / (SWELL_WAVELENGTH_SCALE * SWELL_WAVELENGTH_SCALE), 1.0e-12));
+     const float determinant
+         = (1.0 - bend * hessian.x) * (1.0 - bend * hessian.y) - bend * bend * hessian.z * hessian.z;
+ 
+@@ -339,7 +400,7 @@ float caustic(vec2 at, float depth, float footprint)
+     // against the sea's whole curvature and the Hessian above is only what the cone could resolve, so the
+     // fold the estimator stands at is `toward` scaled by the share still resolved. It goes to nought as the
+     // cone reaches the coarse levels, which is where a surface averaged flat has no gain to remove.
+-    const float fold = toward * sqrt(resolved);
++    const float fold = toward * WATER_MOTION_STRENGTH * sqrt(resolved);
+     const float gathered = 1.0 / (max(abs(determinant), 1.0 / WATER_CAUSTIC_MAX) * causticGain(fold));
+ 
+     // **Snyder and Dera's law, and the whole of why deep water has none of this.** Past the focus a point
+diff --git c/components/rtxvulkan/shaders/lib/turns.glsl w/components/rtxvulkan/shaders/lib/turns.glsl
+index d3979997..ab59ff51 100644
+--- c/components/rtxvulkan/shaders/lib/turns.glsl
++++ w/components/rtxvulkan/shaders/lib/turns.glsl
+@@ -1,6 +1,9 @@
+ #ifndef OPENMW_COMPONENTS_RTXVULKAN_SHADERS_LIB_TURNS_GLSL
+ #define OPENMW_COMPONENTS_RTXVULKAN_SHADERS_LIB_TURNS_GLSL
+ 
++// Time scale for the animated swell and rain rings.
++const float WATER_ANIMATION_SPEED = 0.18;
++
+ #include "scene.h"
+ 
+ /// How far into its turn something that turns `rate` times a second is, `seconds` after nought: the
+diff --git c/components/rtxvulkan/shaders/lib/underwater.glsl w/components/rtxvulkan/shaders/lib/underwater.glsl
+index 83a88d8b..12e98f66 100644
+--- c/components/rtxvulkan/shaders/lib/underwater.glsl
++++ w/components/rtxvulkan/shaders/lib/underwater.glsl
+@@ -21,9 +21,18 @@
+ #include "traversal.glsl"
+ 
+ /// What a path of water this long leaves of the light crossing it, per channel.
++vec3 darkWaterScatter()
++{
++    const vec3 tint = frame.mWaterScatter;
++    const float grey = dot(tint, vec3(0.2126, 0.7152, 0.0722));
++    return 0.15 * mix(tint, vec3(grey), 0.35);
++}
++
+ vec3 waterTransmittance(float path)
+ {
+-    return exp(-WATER_EXTINCTION * path);
++    // Absorb more green and blue to soften the turquoise cast in transmitted light.
++    const vec3 extinction = mix(WATER_EXTINCTION, vec3(WATER_EXTINCTION.x), 0.35);
++    return exp(-(extinction + vec3(0.0025)) * path);
+ }
+ 
+ /// What is left of the daylight by the time it reaches a point, as a fraction per channel.
+@@ -73,6 +82,90 @@ BentPath bentPathAt(vec3 position, SunUnderWater bent)
+     return BentPath(depth, bent.mTravelling, path, position.xy - bent.mTravelling.xy * path);
+ }
+ 
++float pondNoiseCorner(ivec2 cell)
++{
++    uint seed = steppedKey(pixelKey(uvec2(cell)));
++    return randomNext(seed);
++}
++
++// Smooth interpolation avoids a crease when the light crosses a noise-cell boundary.
++float pondNoise(vec2 point)
++{
++    ivec2 cell = ivec2(floor(point));
++    vec2 f = fract(point);
++    f = f*f*f*(f*(6.0*f-15.0)+10.0);
++    return mix(mix(pondNoiseCorner(cell), pondNoiseCorner(cell+ivec2(1,0)), f.x),
++               mix(pondNoiseCorner(cell+ivec2(0,1)), pondNoiseCorner(cell+ivec2(1,1)), f.x), f.y);
++}
++
++// The weather system scales the sun disc by Glare View, which is zero under overcast skies.
++float causticDaylight()
++{
++    float disc = max(frame.mSunDiscColour.r, max(frame.mSunDiscColour.g, frame.mSunDiscColour.b));
++    return frame.mAmbientFromSky * smoothstep(0.0, 0.10, frame.mSun.mDirection.z)
++        * smoothstep(0.0, 0.12, disc);
++}
++
++// Broad variations in focus break up the thin light paths along a rippled pond bed.
++vec3 shallowPondLight(BentPath bent, float footprint, float daylight)
++{
++    const float halfStandingHeight = 64.0;
++    const float spacing = 39.375;
++    const float tintLimit = 192.0;
++    if (bent.mDepth <= 0.0 || bent.mDepth >= tintLimit)
++        return vec3(1.0);
++
++    float tintWeight = smoothstep(0.0, 20.0, bent.mDepth)
++        * (1.0 - smoothstep(16.0, tintLimit, bent.mDepth));
++    vec3 tannin = mix(vec3(1.0), vec3(0.39, 0.28, 0.045), tintWeight);
++    if (bent.mDepth >= halfStandingHeight || footprint >= spacing * 0.4 || daylight <= 0.0)
++        return tannin;
++
++    float shallow = smoothstep(0.0, 4.0, bent.mDepth)
++        * (1.0 - smoothstep(48.0, halfStandingHeight, bent.mDepth));
++
++    vec2 p = bent.mMet / spacing;
++    vec2 phase = phasorAt(turnsAt(0.041, frame.mWaterTime));
++    vec2 drift = phasorAt(turnsAt(0.067, frame.mWaterTime));
++    vec2 sweep = p * 0.72 + 0.48 * phase;
++    vec2 warp = vec2(pondNoise(sweep), pondNoise(sweep.yx + vec2(4.7,18.3)));
++    p += 0.95 * (warp - 0.5);
++    float focus = 0.68 * pondNoise(p * 1.12 + 0.34 * drift)
++                + 0.32 * pondNoise(p.yx * 2.23 + 0.21 * phase + vec2(8.1,1.4));
++    ivec2 cell = ivec2(floor(p));
++    vec2 local = fract(p);
++    float first = 10.0;
++    float second = 10.0;
++    float third = 10.0;
++    for (int y = -1; y <= 1; ++y)
++        for (int x = -1; x <= 1; ++x)
++        {
++            ivec2 offset = ivec2(x,y);
++            uint seed = steppedKey(pixelKey(uvec2(cell + offset)));
++            float u = randomNext(seed);
++            float v = randomNext(seed);
++            vec2 delta = vec2(offset) + 0.2 + 0.6 * vec2(u,v) - local;
++            float d = dot(delta,delta);
++            third = min(third, max(second, d));
++            second = min(second,max(first,d));
++            first = min(first,d);
++        }
++    float visibility = smoothstep(0.34, 0.68, focus);
++    float width = mix(0.145, 0.058, visibility);
++    float filteredWidth = sqrt(width*width + pow(footprint / spacing, 2.0));
++    float offsetFromFold = (sqrt(second) - sqrt(first)) / filteredWidth;
++    float ridge = exp(-0.5 * offsetFromFold * offsetFromFold) * width / filteredWidth;
++    float strength = shallow * (1.0 - smoothstep(0.05, 0.4, footprint / spacing));
++    float concentration = visibility * ridge;
++    // Lift only the resolved, well-focused crest within the incoming light term.
++    float peak = smoothstep(0.60, 0.98, concentration);
++    // Three equidistant cell centers mark a junction of the caustic ridges.
++    float junction = 1.0 - smoothstep(0.0, filteredWidth, sqrt(third) - sqrt(first));
++    float shown = strength * visibility;
++    float light = 1.0 + strength * (0.64 * concentration + 0.85 * peak * peak - 0.055 * visibility);
++    return tannin * mix(1.0, light * (1.0 + 3.0 * shown * junction), daylight);
++}
++
+ /// What a light in the sky has left, and how it has been gathered, by the time it reaches a point.
+ ///
+ /// **The direction is asked for rather than read off the sun**, because a moon is above the water too and
+@@ -89,7 +182,9 @@ vec3 lightThroughWater(BentPath bent, float footprint, float into)
+     // **Read for the lens where the light met the surface, which is up-sun of where it landed**:
+     // the point whose curvature focused it — and the whole of what makes a caustic move with the
+     // depth and with the light rather than sitting still under the bed.
+-    return waterTransmittance(bent.mPath) * (caustic(bent.mMet, bent.mDepth, footprint) * into);
++    float daylight = causticDaylight();
++    float lens = daylight > 0.0 ? mix(1.0, caustic(bent.mMet, bent.mDepth, footprint), daylight) : 1.0;
++    return waterTransmittance(bent.mPath) * shallowPondLight(bent, footprint, daylight) * (lens * into);
+ }
+ 
+ /// What the world leaves of a light in the sky at a point, asked along the path the light took: under the
+@@ -235,7 +330,7 @@ vec3 beamAlong(SkySource source, vec3 from, vec3 direction, float path)
+     const SunUnderWater bent = sunUnderWater(source.mDirection);
+     const vec3 toward = source.mIrradiance * waterCrossingOf(source.mDirection).mBeam
+         * henyeyGreenstein(WATER_ASYMMETRY, -dot(direction, bent.mTravelling));
+-    return frame.mWaterScatter * toward * waterTransmittance(bent.mSlant * waterOver(from))
++    return darkWaterScatter() * toward * waterTransmittance(bent.mSlant * waterOver(from))
+         * gatheredAlong(direction, bent.mSlant, path);
+ }
+ 
+@@ -300,7 +395,7 @@ ColumnStart columnStartOf(vec3 from, vec3 direction, float path)
+     // `(1 - T^2) / 2` it was for every ray; level, it is `1 - T`, and looking up it gathers more.
+     const vec3 transmittance = waterTransmittance(path);
+     const vec3 sky
+-        = frame.mWaterScatter * gatheredAlong(direction, 1.0, path) * frame.mWaterAmbient * daylightReaching(from);
++        = darkWaterScatter() * gatheredAlong(direction, 1.0, path) * frame.mWaterAmbient * daylightReaching(from);
+ 
+     // **Every light in the sky, as a surface's `GatherRun` walks them**, so the water in front of a
+     // bed a moon lights is lit by the same moon. A moon's beam is the closed form alone: the
+@@ -419,7 +514,7 @@ void startShaftStep(inout ColumnRun run, inout SkyPassageRun skyPassage)
+     const vec2 draw = fract(run.mAimed + float(run.mShaft) * R2_STEPS);
+     skyPassage = skyPassageRunOf(skySourceAt(SKY_SOURCE_SUN), at, vec3(0.0), bent, draw, false);
+ 
+-    run.mLensed = weight * mix(1.0, caustic(bent.mMet, bent.mDepth, run.mFootprint), run.mShow);
++    run.mLensed = weight * mix(1.0, caustic(bent.mMet, bent.mDepth, run.mFootprint), run.mShow * causticDaylight());
+     run.mPlain += weight;
+     run.mBehind = ahead;
+ }
+diff --git c/components/rtxvulkan/shaders/lib/water.glsl w/components/rtxvulkan/shaders/lib/water.glsl
+index cc9235d0..c80a0a37 100644
+--- c/components/rtxvulkan/shaders/lib/water.glsl
++++ w/components/rtxvulkan/shaders/lib/water.glsl
+@@ -93,6 +93,7 @@ uint waterFieldOf(uvec2 pixel)
+ /// for the media stage a walk of its own (`ColumnRun`), as the step's purpose says (`stepWater`).
+ struct WaterRun
+ {
++    float mPadTransmission;
+     /// `RUN_IDLE` once the answer below is whole.
+     uint mStep;
+ 
+@@ -182,6 +183,7 @@ WaterRun waterRunOf(vec3 incident, Cone cone, uint field)
+     run.mPathAsk = noRay();
+     run.mFound = false;
+     run.mDistance = 0.0;
++    run.mPadTransmission = 1.0;
+     run.mWeight = vec3(0.0);
+     run.mScattered = vec3(0.0);
+     run.mMissed = vec3(0.0);
+@@ -202,7 +204,7 @@ struct WaterShares
+ 
+ WaterShares waterSharesOf(WaterRun run)
+ {
+-    const float split = run.mSplit ? 2.0 : 1.0;
++    const float split = (run.mSplit ? 2.0 : 1.0) * run.mPadTransmission;
+     const float fresnel = run.mFresnel;
+     return run.mMirror ? WaterShares(0.0, split * fresnel * run.mShore)
+                        : WaterShares(split * (1.0 - run.mShore), split * (1.0 - fresnel) * run.mShore);
+@@ -229,7 +231,7 @@ void stepWater(
+ 
+         // Keyed off world position rather than anything interpolated, so one cell's surface continues
+         // into the next without a seam at the boundary.
+-        const WaterSurface sea = waterSurfaceAt(surface.mPosition.xy, surface.mFootprint);
++        const WaterSurface sea = waterSurfaceAt(surface.mPosition, surface.mFootprint);
+ 
+         // **The lost slopes as a roughness, the one a painted map states.** The cone they widen a
+         // reflection by is the lobe's own, as a solid's is, and never wider than a diffuse bounce's.
+@@ -256,6 +258,7 @@ void stepWater(
+         countNotFinite(normal);
+         run.mResponse = SurfaceResponse(packSurfaceNormal(normal), vec3(0.0), vec3(0.0), vec3(1.0));
+ 
++        run.mPadTransmission = fromBelow ? 1.0 : 1.0 - sea.mPadShade;
+         run.mFromBelow = fromBelow;
+         run.mPlane = plane;
+         run.mNormal = normal;
+diff --git c/components/rtxvulkan/shaders/trace/waverows.comp w/components/rtxvulkan/shaders/trace/waverows.comp
+index 4464eb78..67790239 100644
+--- c/components/rtxvulkan/shaders/trace/waverows.comp
++++ w/components/rtxvulkan/shaders/trace/waverows.comp
+@@ -80,7 +80,7 @@ void main()
+ 
+         // The partner turns by the conjugate, so the pair is conjugate to the bit and not to two
+         // calls of `sin` agreeing on a negated angle.
+-        const vec2 phasor = phasorAt(turnsAt(turnRates[at], frame.mTime));
++        const vec2 phasor = phasorAt(turnsAt(turnRates[at] * WATER_ANIMATION_SPEED, frame.mTime));
+         const vec2 ahead = turnedBy(amplitudes[at], phasor);
+         const vec2 behind = turnedBy(vec2(amplitudes[mirror].x, -amplitudes[mirror].y), vec2(phasor.x, -phasor.y));
+ 
