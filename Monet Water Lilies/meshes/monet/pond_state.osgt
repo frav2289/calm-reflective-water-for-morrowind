@@ -1,0 +1,47 @@
+#Ascii Scene
+#Version 161
+#Generator OpenSceneGraph 3.6.5
+osg::Geode {
+UniqueID 505
+Drawables 1 {
+osg::Geometry {
+UniqueID 504
+StateSet TRUE {
+osg::StateSet {
+UniqueID 501
+ModeList 1 {
+GL_ALPHA_TEST ON
+}
+AttributeList 1 {
+osg::AlphaFunc {
+UniqueID 500
+Function NEVER
+ReferenceValue 0.734375
+}
+Value OFF
+}
+}
+}
+PrimitiveSetList 1 {
+osg::DrawElementsUInt {
+UniqueID 502
+Mode TRIANGLES
+vector 3 {
+0 1 2
+}
+}
+}
+VertexArray TRUE {
+osg::Vec3Array {
+UniqueID 503
+Binding BIND_PER_VERTEX
+vector 3 {
+-3500 -2500 -3.375
+3500 -2500 -3.375
+0 4500 -3.375
+}
+}
+}
+}
+}
+}

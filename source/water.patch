@@ -1,6 +1,6 @@
-diff --git c/components/rtxvulkan/shaders/lib/sea.glsl w/components/rtxvulkan/shaders/lib/sea.glsl
+diff --git i/components/rtxvulkan/shaders/lib/sea.glsl w/components/rtxvulkan/shaders/lib/sea.glsl
 index 0a198a8c..9a11e43a 100644
---- c/components/rtxvulkan/shaders/lib/sea.glsl
+--- i/components/rtxvulkan/shaders/lib/sea.glsl
 +++ w/components/rtxvulkan/shaders/lib/sea.glsl
 @@ -20,8 +20,65 @@
  #include "turns.glsl"
@@ -186,9 +186,208 @@ index 0a198a8c..9a11e43a 100644
      const float gathered = 1.0 / (max(abs(determinant), 1.0 / WATER_CAUSTIC_MAX) * causticGain(fold));
  
      // **Snyder and Dera's law, and the whole of why deep water has none of this.** Past the focus a point
-diff --git c/components/rtxvulkan/shaders/lib/turns.glsl w/components/rtxvulkan/shaders/lib/turns.glsl
+diff --git i/components/rtxvulkan/shaders/lib/shading.glsl w/components/rtxvulkan/shaders/lib/shading.glsl
+index cbd1364a..a2be982a 100644
+--- i/components/rtxvulkan/shaders/lib/shading.glsl
++++ w/components/rtxvulkan/shaders/lib/shading.glsl
+@@ -403,7 +403,35 @@ vec3 litSurface(Surface surface, vec3 diffuse, vec3 specular)
+     // The emissive colour joins the light rather than the albedo, which is where the original engine puts
+     // it: it sums the term with the diffuse and ambient light and multiplies the whole by the texture
+     // (`files/shaders/compatibility/objects.frag:232`).
+-    return surface.mAlbedo * (diffuse + surface.mEmissiveColour * EMISSIVE_INTENSITY) + surface.mEmitted + specular;
++    vec3 glow = surface.mEmitted;
++    float height = surface.mPosition.z - frame.mWaterLevel;
++    float sun = causticDaylight();
++    if (HAS_SEA && sun > 0.0 && height > -64.0 && height < 128.0)
++    {
++        vec3 travel = height > 0.0 ? reflect(-frame.mSun.mDirection, vec3(0, 0, 1))
++                                   : sunUnderWater(frame.mSun.mDirection).mTravelling;
++        float incidence = max(dot(surface.mGeometric, -travel), 0.0);
++        float distance = height / travel.z;
++        if (incidence > 0.0 && distance > 0.25 && distance < 240.0)
++        {
++            vec3 entry = surface.mPosition - distance * travel;
++            WorldRay probe = WorldRay(leaveSurface(surface.mPosition, stepOf(surface), -travel), -travel);
++            SceneAnswer hit = queryScene(surfaceWithinQuery(probe, 0.0, distance + 8.0,
++                Cone(surface.mFootprint, 0.0), RayRule(solidMask(frame.mRayMask) | MASK_WATER, MEET_BY_CHANCE, false)));
++            if (hit.mCommitted != 0u && hit.mKind == KIND_WATER)
++            {
++                float focus = pondCausticPattern(entry.xy, surface.mFootprint);
++                float fade = height > 0.0 ? 1.0 - smoothstep(70.0, 128.0, height)
++                                          : 1.0 - smoothstep(48.0, 64.0, -height);
++                vec3 tint = height > 0.0 ? vec3(1.0) : waterTransmittance(distance);
++                vec3 atWater = probe.mFrom + hit.mDistance * probe.mAlong;
++                float visible = skyVisible(frame.mSun, atWater + vec3(0, 0, 0.2), vec3(0), vec2(0.5));
++                glow += surface.mAlbedo * frame.mSun.mIrradiance * tint
++                    * (sun * visible * fade * focus * incidence * 0.42);
++            }
++        }
++    }
++    return surface.mAlbedo * (diffuse + surface.mEmissiveColour * EMISSIVE_INTENSITY) + glow + specular;
+ }
+ 
+ /// What a surface sends back, with the shadowed sources kept apart: `CHANNEL_SHADOWED`'s and
+diff --git i/components/rtxvulkan/shaders/lib/traversal.glsl w/components/rtxvulkan/shaders/lib/traversal.glsl
+index bb76c0e5..03c92bb8 100644
+--- i/components/rtxvulkan/shaders/lib/traversal.glsl
++++ w/components/rtxvulkan/shaders/lib/traversal.glsl
+@@ -26,6 +26,57 @@
+ #include "texturing.glsl"
+ #include "variants.glsl"
+ 
++#include "frame.glsl"
++#include "turns.glsl"
++
++// A hidden, alpha-rejected triangle follows the player. Lua encodes the settled
++// sediment fraction in its height and the time/weather factor in its rotation.
++vec2 pondConditions()
++{
++    vec3 start = vec3(frame.mOrigin.xy, frame.mWaterLevel - 2900.0);
++    rayQueryEXT query;
++    rayQueryInitializeEXT(query, sceneTop, gl_RayFlagsNoOpaqueEXT, MASK_STATIC,
++        start, 0.0, vec3(0, 0, -1), 250.0);
++    while (rayQueryProceedEXT(query))
++    {
++        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
++            continue;
++        vec3 corners[3];
++        rayQueryGetIntersectionTriangleVertexPositionsEXT(query, false, corners);
++        if (all(equal(vec3(corners[0].z, corners[1].z, corners[2].z), vec3(-3.375))))
++        {
++            mat4x3 placement = rayQueryGetIntersectionObjectToWorldEXT(query, false);
++            return clamp(vec2((placement[3].z - frame.mWaterLevel + 3072.0) / 64.0,
++                abs(placement[0].x)), 0.0, 1.0);
++        }
++    }
++    return vec2(0.0);
++}
++
++vec2 sedimentGradient(ivec2 cell)
++{
++    uint seed = steppedKey(pixelKey(uvec2(cell)));
++    float angle = TAU * randomNext(seed);
++    return vec2(cos(angle), sin(angle));
++}
++
++float sedimentNoise(vec2 p)
++{
++    ivec2 i = ivec2(floor(p));
++    vec2 f = fract(p);
++    vec2 w = f*f*f*(f*(f*6.0-15.0)+10.0);
++    return mix(mix(dot(sedimentGradient(i), f), dot(sedimentGradient(i+ivec2(1,0)), f-vec2(1,0)), w.x),
++               mix(dot(sedimentGradient(i+ivec2(0,1)), f-vec2(0,1)),
++                   dot(sedimentGradient(i+ivec2(1)), f-vec2(1)), w.x), w.y);
++}
++
++// Change HSV saturation while preserving the value channel.
++vec3 pondSaturate(vec3 rgb, float gain)
++{
++    float value = max(rgb.r, max(rgb.g, rgb.b));
++    return max(vec3(0.0), vec3(value) + gain * (rgb - value));
++}
++
+ /// The shortest distance to a light worth a ray, in world units: a light nearer the point than this
+ /// is one nothing can stand between. **Not where a ray starts**, which is `leaveSurface`'s.
+ const float SHADOW_BIAS = 1.0;
+@@ -295,6 +346,13 @@ const uint MEET_BY_CHANCE = 1u;
+ /// itself (`visibility.comp`), and by a falling drop's shelter ray, since glass keeps rain off as a
+ /// roof does.
+ const uint MEET_AS_SOLID = 2u;
++const uint MEET_SHORE_BED = 3u;
++
++// The koi material carries this near-white ambient tint on both animated pieces.
++bool isPondKoi(GpuMaterial material)
++{
++    return all(lessThan(abs(material.mAmbientColour - decodeSrgb(vec3(0.98, 0.96, 0.99))), vec3(0.0002)));
++}
+ 
+ /// A key a ray draws from, made of the ray itself: where it leaves and which way, so two rays a
+ /// pixel apart or a frame apart draw apart without a pixel's key handed down every traversal.
+@@ -334,10 +392,13 @@ bool candidateStops(Candidate candidate, TriangleEdges edges, vec3 direction, fl
+     const GpuInstance instance = instanceAt(candidate.mInstance);
+     const GpuMaterial material = materialAt(instance.mMaterial);
+ 
++    if (meet == MEET_SHORE_BED && isPondKoi(material))
++        return false;
++
+     const float opacity = surfaceOpacity(instance, material);
+     const bool seenThrough = isSeenThrough(opacity, material);
+     const bool walkPast = meet == MEET_WALK_PAST && seenThrough;
+-    const bool byChance = meet == MEET_BY_CHANCE && seenThrough;
++    const bool byChance = (meet == MEET_BY_CHANCE || meet == MEET_SHORE_BED) && seenThrough;
+ 
+     // **Nothing stops on a medium, whatever the ray was asking.** A surface that is nowhere opaque is not a
+     // surface: the eye walks through a cloud and commits the mountain behind it, and a bounce does the
+@@ -485,7 +546,7 @@ SceneAnswer queryScene(SceneQuery asked)
+     rayQueryEXT query;
+     rayQueryInitializeEXT(query, sceneTop, asked.mFlags, asked.mMask, asked.mFrom, asked.mTmin, asked.mAlong, asked.mTmax);
+ 
+-    const uint rayKey = asked.mMeet == MEET_BY_CHANCE
++    const uint rayKey = (asked.mMeet == MEET_BY_CHANCE || asked.mMeet == MEET_SHORE_BED)
+         ? rayKeyOf(rayQueryGetWorldRayOriginEXT(query), rayQueryGetWorldRayDirectionEXT(query))
+         : 0u;
+ 
+@@ -930,9 +991,11 @@ float surfaceWithin(WorldRay ray, float tmin, float reach, Cone cone, RayRule ru
+     return withinOf(queryScene(surfaceWithinQuery(ray, tmin, reach, cone, rule)), reach);
+ }
+ 
+-RayAsk solidWithinAsk(WorldRay ray, float tmin, float reach, Cone cone)
++RayAsk shoreBedAsk(WorldRay ray, float tmin, float reach, Cone cone)
+ {
+-    return rayOf(surfaceWithinQuery(ray, tmin, reach, cone, RayRule(solidMask(frame.mRayMask), MEET_BY_CHANCE, false)));
++    SceneQuery probe = surfaceWithinQuery(ray, tmin, reach, cone, RayRule(solidMask(frame.mRayMask), MEET_SHORE_BED, false));
++    probe.mFlags |= gl_RayFlagsNoOpaqueEXT;
++    return rayOf(probe);
+ }
+ 
+ /// What a ray found, resolved down to the inputs shading needs.
+@@ -1404,6 +1467,43 @@ Surface resolve(Hit hit, vec3 origin, vec3 direction, bool detailed)
+     surface.mAmbientAlbedo
+         = lit ? min(surface.mAmbientAlbedo + sheet / SUNLIT_WHITE, vec3(1.0)) : surface.mAmbientAlbedo;
+ 
++    vec3 colour = surface.mAlbedo;
++    vec3 glow = surface.mEmitted;
++    vec3 emission = surface.mEmissiveColour;
++    // Monet pads carry a distinctive emissive material swatch, decoded from sRGB.
++    bool pad = emission.r > 0.99 && emission.g == 0.0 && abs(emission.b - 0.05127) < 0.002;
++    float depth = waterOver(surface.mPosition);
++    if (pad)
++    {
++        emission = vec3(0.0);
++        if (surface.mGeometric.z < -0.2 && HAS_SEA && !isinf(frame.mWaterLevel))
++            glow += 0.12 * pondSaturate(colour, 2.50) * pondConditions().y;
++    }
++    else if (depth > 0.0 && depth < 192.0)
++    {
++        // Three scaled pad thicknesses, feathered about the shore fade midpoint.
++        float band = 1.0 - smoothstep(0.0, 2.25, abs(depth - 0.5 * WATER_SHORE_FADE));
++        colour = pondSaturate(colour, 1.0 + 0.47 * band);
++        float sediment = surface.mGround ? pondConditions().x : 0.0;
++        if (sediment > 0.0)
++        {
++            vec2 drift = phasorAt(turnsAt(0.013, frame.mWaterTime));
++            // Integrate two layers just above the bed along the viewing ray.
++            float lift = min(depth, 16.0 * sediment);
++            vec3 travel = -surface.mIncident * lift / max(abs(surface.mIncident.z), 0.25);
++            vec2 p = (surface.mPosition.xy + 0.25 * travel.xy) / 55.0;
++            vec2 upper = (surface.mPosition.xy + 0.75 * travel.xy) / 55.0;
++            float cloud = smoothstep(-0.45, 0.45, sedimentNoise(p + drift)
++                + 0.40 * sedimentNoise(upper * 2.3 - drift));
++            float haze = sediment * cloud * smoothstep(0.0, 8.0, depth)
++                * (1.0 - smoothstep(144.0, 192.0, depth));
++            colour = mix(colour, vec3(0.17, 0.087, 0.037), 0.72 * haze);
++        }
++    }
++    surface.mAmbientAlbedo = max(vec3(0.0), surface.mAmbientAlbedo + colour - surface.mAlbedo);
++    surface.mAlbedo = colour;
++    surface.mEmitted = glow;
++    surface.mEmissiveColour = emission;
+     return surface;
+ }
+ 
+diff --git i/components/rtxvulkan/shaders/lib/turns.glsl w/components/rtxvulkan/shaders/lib/turns.glsl
 index d3979997..ab59ff51 100644
---- c/components/rtxvulkan/shaders/lib/turns.glsl
+--- i/components/rtxvulkan/shaders/lib/turns.glsl
 +++ w/components/rtxvulkan/shaders/lib/turns.glsl
 @@ -1,6 +1,9 @@
  #ifndef OPENMW_COMPONENTS_RTXVULKAN_SHADERS_LIB_TURNS_GLSL
@@ -200,9 +399,9 @@ index d3979997..ab59ff51 100644
  #include "scene.h"
  
  /// How far into its turn something that turns `rate` times a second is, `seconds` after nought: the
-diff --git c/components/rtxvulkan/shaders/lib/underwater.glsl w/components/rtxvulkan/shaders/lib/underwater.glsl
-index 83a88d8b..12e98f66 100644
---- c/components/rtxvulkan/shaders/lib/underwater.glsl
+diff --git i/components/rtxvulkan/shaders/lib/underwater.glsl w/components/rtxvulkan/shaders/lib/underwater.glsl
+index 83a88d8b..0b7fb772 100644
+--- i/components/rtxvulkan/shaders/lib/underwater.glsl
 +++ w/components/rtxvulkan/shaders/lib/underwater.glsl
 @@ -21,9 +21,18 @@
  #include "traversal.glsl"
@@ -224,7 +423,7 @@ index 83a88d8b..12e98f66 100644
  }
  
  /// What is left of the daylight by the time it reaches a point, as a fraction per channel.
-@@ -73,6 +82,90 @@ BentPath bentPathAt(vec3 position, SunUnderWater bent)
+@@ -73,6 +82,83 @@ BentPath bentPathAt(vec3 position, SunUnderWater bent)
      return BentPath(depth, bent.mTravelling, path, position.xy - bent.mTravelling.xy * path);
  }
  
@@ -252,32 +451,9 @@ index 83a88d8b..12e98f66 100644
 +        * smoothstep(0.0, 0.12, disc);
 +}
 +
-+// Broad variations in focus break up the thin light paths along a rippled pond bed.
-+vec3 shallowPondLight(BentPath bent, float footprint, float daylight)
++// Distance to the two closest sites is equal along a Voronoi ridge.
++vec2 pondRidgeGaps(vec2 p)
 +{
-+    const float halfStandingHeight = 64.0;
-+    const float spacing = 39.375;
-+    const float tintLimit = 192.0;
-+    if (bent.mDepth <= 0.0 || bent.mDepth >= tintLimit)
-+        return vec3(1.0);
-+
-+    float tintWeight = smoothstep(0.0, 20.0, bent.mDepth)
-+        * (1.0 - smoothstep(16.0, tintLimit, bent.mDepth));
-+    vec3 tannin = mix(vec3(1.0), vec3(0.39, 0.28, 0.045), tintWeight);
-+    if (bent.mDepth >= halfStandingHeight || footprint >= spacing * 0.4 || daylight <= 0.0)
-+        return tannin;
-+
-+    float shallow = smoothstep(0.0, 4.0, bent.mDepth)
-+        * (1.0 - smoothstep(48.0, halfStandingHeight, bent.mDepth));
-+
-+    vec2 p = bent.mMet / spacing;
-+    vec2 phase = phasorAt(turnsAt(0.041, frame.mWaterTime));
-+    vec2 drift = phasorAt(turnsAt(0.067, frame.mWaterTime));
-+    vec2 sweep = p * 0.72 + 0.48 * phase;
-+    vec2 warp = vec2(pondNoise(sweep), pondNoise(sweep.yx + vec2(4.7,18.3)));
-+    p += 0.95 * (warp - 0.5);
-+    float focus = 0.68 * pondNoise(p * 1.12 + 0.34 * drift)
-+                + 0.32 * pondNoise(p.yx * 2.23 + 0.21 * phase + vec2(8.1,1.4));
 +    ivec2 cell = ivec2(floor(p));
 +    vec2 local = fract(p);
 +    float first = 10.0;
@@ -296,37 +472,52 @@ index 83a88d8b..12e98f66 100644
 +            second = min(second,max(first,d));
 +            first = min(first,d);
 +        }
++    return sqrt(vec2(second, third)) - sqrt(first);
++}
++
++float pondCausticPattern(vec2 entry, float footprint)
++{
++    const float spacing = 19.6875;
++    // Wide bounce cones gather light from several ridges on the bed.
++    const float meanEmission = 0.28;
++    float blur = footprint / spacing;
++    if (blur >= 0.4)
++        return meanEmission;
++
++    vec2 p = entry / spacing;
++    vec2 phase = phasorAt(turnsAt(0.041, frame.mWaterTime));
++    vec2 drift = phasorAt(turnsAt(0.067, frame.mWaterTime));
++    vec2 sweep = p * 0.72 + 0.48 * phase;
++    p += 0.95 * (vec2(pondNoise(sweep), pondNoise(sweep.yx + vec2(4.7, 18.3))) - 0.5);
++    float focus = 0.68 * pondNoise(p * 1.12 + 0.34 * drift)
++                + 0.32 * pondNoise(p.yx * 2.23 + 0.21 * phase + vec2(8.1, 1.4));
 +    float visibility = smoothstep(0.34, 0.68, focus);
 +    float width = mix(0.145, 0.058, visibility);
-+    float filteredWidth = sqrt(width*width + pow(footprint / spacing, 2.0));
-+    float offsetFromFold = (sqrt(second) - sqrt(first)) / filteredWidth;
-+    float ridge = exp(-0.5 * offsetFromFold * offsetFromFold) * width / filteredWidth;
-+    float strength = shallow * (1.0 - smoothstep(0.05, 0.4, footprint / spacing));
++    float filtered = sqrt(width * width + blur * blur);
++    vec2 gaps = pondRidgeGaps(p);
++    float offset = gaps.x / filtered;
++    float ridge = exp(-0.5 * offset * offset) * width / filtered;
 +    float concentration = visibility * ridge;
-+    // Lift only the resolved, well-focused crest within the incoming light term.
 +    float peak = smoothstep(0.60, 0.98, concentration);
-+    // Three equidistant cell centers mark a junction of the caustic ridges.
-+    float junction = 1.0 - smoothstep(0.0, filteredWidth, sqrt(third) - sqrt(first));
-+    float shown = strength * visibility;
-+    float light = 1.0 + strength * (0.64 * concentration + 0.85 * peak * peak - 0.055 * visibility);
-+    return tannin * mix(1.0, light * (1.0 + 3.0 * shown * junction), daylight);
++    float junction = 1.0 - smoothstep(0.0, filtered, gaps.y);
++    float net = 0.64 * concentration + 0.85 * peak * peak + 3.0 * visibility * junction;
++    return mix(net, meanEmission, smoothstep(0.06, 0.4, blur));
 +}
 +
  /// What a light in the sky has left, and how it has been gathered, by the time it reaches a point.
  ///
  /// **The direction is asked for rather than read off the sun**, because a moon is above the water too and
-@@ -89,7 +182,9 @@ vec3 lightThroughWater(BentPath bent, float footprint, float into)
+@@ -89,7 +175,8 @@ vec3 lightThroughWater(BentPath bent, float footprint, float into)
      // **Read for the lens where the light met the surface, which is up-sun of where it landed**:
      // the point whose curvature focused it — and the whole of what makes a caustic move with the
      // depth and with the light rather than sitting still under the bed.
 -    return waterTransmittance(bent.mPath) * (caustic(bent.mMet, bent.mDepth, footprint) * into);
-+    float daylight = causticDaylight();
-+    float lens = daylight > 0.0 ? mix(1.0, caustic(bent.mMet, bent.mDepth, footprint), daylight) : 1.0;
-+    return waterTransmittance(bent.mPath) * shallowPondLight(bent, footprint, daylight) * (lens * into);
++    float tint = smoothstep(0.0, 20.0, bent.mDepth) * (1.0 - smoothstep(16.0, 192.0, bent.mDepth));
++    return waterTransmittance(bent.mPath) * mix(vec3(1.0), vec3(0.39, 0.28, 0.045), tint) * into;
  }
  
  /// What the world leaves of a light in the sky at a point, asked along the path the light took: under the
-@@ -235,7 +330,7 @@ vec3 beamAlong(SkySource source, vec3 from, vec3 direction, float path)
+@@ -235,7 +322,7 @@ vec3 beamAlong(SkySource source, vec3 from, vec3 direction, float path)
      const SunUnderWater bent = sunUnderWater(source.mDirection);
      const vec3 toward = source.mIrradiance * waterCrossingOf(source.mDirection).mBeam
          * henyeyGreenstein(WATER_ASYMMETRY, -dot(direction, bent.mTravelling));
@@ -335,7 +526,7 @@ index 83a88d8b..12e98f66 100644
          * gatheredAlong(direction, bent.mSlant, path);
  }
  
-@@ -300,7 +395,7 @@ ColumnStart columnStartOf(vec3 from, vec3 direction, float path)
+@@ -300,7 +387,7 @@ ColumnStart columnStartOf(vec3 from, vec3 direction, float path)
      // `(1 - T^2) / 2` it was for every ray; level, it is `1 - T`, and looking up it gathers more.
      const vec3 transmittance = waterTransmittance(path);
      const vec3 sky
@@ -344,7 +535,7 @@ index 83a88d8b..12e98f66 100644
  
      // **Every light in the sky, as a surface's `GatherRun` walks them**, so the water in front of a
      // bed a moon lights is lit by the same moon. A moon's beam is the closed form alone: the
-@@ -419,7 +514,7 @@ void startShaftStep(inout ColumnRun run, inout SkyPassageRun skyPassage)
+@@ -419,7 +506,7 @@ void startShaftStep(inout ColumnRun run, inout SkyPassageRun skyPassage)
      const vec2 draw = fract(run.mAimed + float(run.mShaft) * R2_STEPS);
      skyPassage = skyPassageRunOf(skySourceAt(SKY_SOURCE_SUN), at, vec3(0.0), bent, draw, false);
  
@@ -353,9 +544,9 @@ index 83a88d8b..12e98f66 100644
      run.mPlain += weight;
      run.mBehind = ahead;
  }
-diff --git c/components/rtxvulkan/shaders/lib/water.glsl w/components/rtxvulkan/shaders/lib/water.glsl
-index cc9235d0..c80a0a37 100644
---- c/components/rtxvulkan/shaders/lib/water.glsl
+diff --git i/components/rtxvulkan/shaders/lib/water.glsl w/components/rtxvulkan/shaders/lib/water.glsl
+index cc9235d0..7d040bbd 100644
+--- i/components/rtxvulkan/shaders/lib/water.glsl
 +++ w/components/rtxvulkan/shaders/lib/water.glsl
 @@ -93,6 +93,7 @@ uint waterFieldOf(uvec2 pixel)
  /// for the media stage a walk of its own (`ColumnRun`), as the step's purpose says (`stepWater`).
@@ -373,7 +564,7 @@ index cc9235d0..c80a0a37 100644
      run.mWeight = vec3(0.0);
      run.mScattered = vec3(0.0);
      run.mMissed = vec3(0.0);
-@@ -202,7 +204,7 @@ struct WaterShares
+@@ -202,12 +204,32 @@ struct WaterShares
  
  WaterShares waterSharesOf(WaterRun run)
  {
@@ -382,7 +573,32 @@ index cc9235d0..c80a0a37 100644
      const float fresnel = run.mFresnel;
      return run.mMirror ? WaterShares(0.0, split * fresnel * run.mShore)
                         : WaterShares(split * (1.0 - run.mShore), split * (1.0 - fresnel) * run.mShore);
-@@ -229,7 +231,7 @@ void stepWater(
+ }
+ 
++// As rain intensifies, suspended silt spreads across the transmitted view.
++void applyRainSilt(inout WaterRun run, WaterShares shares)
++{
++    if (run.mMirror || run.mFromBelow)
++        return;
++    float sediment = pondConditions().x;
++    if (sediment <= 0.0)
++        return;
++    vec2 p = run.mPosition.xy / 55.0;
++    vec2 drift = phasorAt(turnsAt(0.013, frame.mWaterTime));
++    float cloud = smoothstep(-0.45, 0.45, sedimentNoise(p + drift)
++        + 0.4 * sedimentNoise(2.3 * p - drift));
++    float coverage = sediment * mix(cloud, 1.0, sediment);
++    float haze = 0.72 * coverage;
++    vec3 silt = vec3(0.17, 0.087, 0.037) * frame.mWaterAmbient;
++    run.mWeight *= 1.0 - haze;
++    run.mScattered = mix(run.mScattered, (shares.mWhole + shares.mThrough) * silt, haze);
++    run.mShafts *= 1.0 - haze;
++}
++
+ /// @param surface the walk's surface: the water's own when the walk starts, and what the path found
+ ///        once its ray is answered.
+ /// @param purpose `WATER_SHADES` or `WATER_MARCHES`, a constant of the kernel's call, so a kernel
+@@ -229,7 +251,7 @@ void stepWater(
  
          // Keyed off world position rather than anything interpolated, so one cell's surface continues
          // into the next without a seam at the boundary.
@@ -391,7 +607,7 @@ index cc9235d0..c80a0a37 100644
  
          // **The lost slopes as a roughness, the one a painted map states.** The cone they widen a
          // reflection by is the lobe's own, as a solid's is, and never wider than a diffuse bounce's.
-@@ -256,6 +258,7 @@ void stepWater(
+@@ -256,6 +278,7 @@ void stepWater(
          countNotFinite(normal);
          run.mResponse = SurfaceResponse(packSurfaceNormal(normal), vec3(0.0), vec3(0.0), vec3(1.0));
  
@@ -399,9 +615,34 @@ index cc9235d0..c80a0a37 100644
          run.mFromBelow = fromBelow;
          run.mPlane = plane;
          run.mNormal = normal;
-diff --git c/components/rtxvulkan/shaders/trace/waverows.comp w/components/rtxvulkan/shaders/trace/waverows.comp
+@@ -287,7 +310,7 @@ void stepWater(
+             const vec3 down = vec3(0.0, 0.0, -1.0);
+             const vec3 below = leaveSurface(surface.mPosition, plane * surface.mRounding, down);
+             run.mClearing = surface.mPosition.z - below.z;
+-            ask = solidWithinAsk(WorldRay(below, down), 0.0, WATER_SHORE_FADE - run.mClearing,
++            ask = shoreBedAsk(WorldRay(below, down), 0.0, WATER_SHORE_FADE - run.mClearing,
+                 Cone(surface.mFootprint, run.mCone.mSpread));
+         }
+         run.mStep = WATER_SHORE;
+@@ -366,6 +389,7 @@ void stepWater(
+             run.mMarches = start.mMarches;
+             run.mWeight = vec3(shares.mWhole) + shares.mThrough * under.mTransmittance;
+             run.mScattered = shares.mThrough * under.mScattered;
++            applyRainSilt(run, shares);
+             run.mStep = RUN_IDLE;
+             return;
+         }
+@@ -384,6 +408,7 @@ void stepWater(
+     run.mWeight = vec3(shares.mWhole) + shares.mThrough * under.mTransmittance;
+     run.mScattered = shares.mThrough * under.mScattered;
+     run.mShafts = shares.mThrough * column.mShafts;
++    applyRainSilt(run, shares);
+     run.mStep = RUN_IDLE;
+ }
+ 
+diff --git i/components/rtxvulkan/shaders/trace/waverows.comp w/components/rtxvulkan/shaders/trace/waverows.comp
 index 4464eb78..67790239 100644
---- c/components/rtxvulkan/shaders/trace/waverows.comp
+--- i/components/rtxvulkan/shaders/trace/waverows.comp
 +++ w/components/rtxvulkan/shaders/trace/waverows.comp
 @@ -80,7 +80,7 @@ void main()
  
