@@ -228,10 +228,10 @@ index cbd1364a..a2be982a 100644
  
  /// What a surface sends back, with the shadowed sources kept apart: `CHANNEL_SHADOWED`'s and
 diff --git i/components/rtxvulkan/shaders/lib/traversal.glsl w/components/rtxvulkan/shaders/lib/traversal.glsl
-index bb76c0e5..03c92bb8 100644
+index bb76c0e5..e1ec02f9 100644
 --- i/components/rtxvulkan/shaders/lib/traversal.glsl
 +++ w/components/rtxvulkan/shaders/lib/traversal.glsl
-@@ -26,6 +26,57 @@
+@@ -26,6 +26,67 @@
  #include "texturing.glsl"
  #include "variants.glsl"
  
@@ -240,7 +240,7 @@ index bb76c0e5..03c92bb8 100644
 +
 +// A hidden, alpha-rejected triangle follows the player. Lua encodes the settled
 +// sediment fraction in its height and the time/weather factor in its rotation.
-+vec2 pondConditions()
++vec2 readPondMarker()
 +{
 +    vec3 start = vec3(frame.mOrigin.xy, frame.mWaterLevel - 2900.0);
 +    rayQueryEXT query;
@@ -260,6 +260,16 @@ index bb76c0e5..03c92bb8 100644
 +        }
 +    }
 +    return vec2(0.0);
++}
++
++vec2 pondConditions()
++{
++#ifdef POND_FRAME_READY
++    // The scatter launch records these two frame-wide values before the surface passes.
++    return vec2(texelFetch(fogLamps, ivec3(0), 0).a, texelFetch(fogLamps, ivec3(0, 0, 1), 0).a);
++#else
++    return readPondMarker();
++#endif
 +}
 +
 +vec2 sedimentGradient(ivec2 cell)
@@ -289,7 +299,7 @@ index bb76c0e5..03c92bb8 100644
  /// The shortest distance to a light worth a ray, in world units: a light nearer the point than this
  /// is one nothing can stand between. **Not where a ray starts**, which is `leaveSurface`'s.
  const float SHADOW_BIAS = 1.0;
-@@ -295,6 +346,13 @@ const uint MEET_BY_CHANCE = 1u;
+@@ -295,6 +356,13 @@ const uint MEET_BY_CHANCE = 1u;
  /// itself (`visibility.comp`), and by a falling drop's shelter ray, since glass keeps rain off as a
  /// roof does.
  const uint MEET_AS_SOLID = 2u;
@@ -303,7 +313,7 @@ index bb76c0e5..03c92bb8 100644
  
  /// A key a ray draws from, made of the ray itself: where it leaves and which way, so two rays a
  /// pixel apart or a frame apart draw apart without a pixel's key handed down every traversal.
-@@ -334,10 +392,13 @@ bool candidateStops(Candidate candidate, TriangleEdges edges, vec3 direction, fl
+@@ -334,10 +402,13 @@ bool candidateStops(Candidate candidate, TriangleEdges edges, vec3 direction, fl
      const GpuInstance instance = instanceAt(candidate.mInstance);
      const GpuMaterial material = materialAt(instance.mMaterial);
  
@@ -318,7 +328,7 @@ index bb76c0e5..03c92bb8 100644
  
      // **Nothing stops on a medium, whatever the ray was asking.** A surface that is nowhere opaque is not a
      // surface: the eye walks through a cloud and commits the mountain behind it, and a bounce does the
-@@ -485,7 +546,7 @@ SceneAnswer queryScene(SceneQuery asked)
+@@ -485,7 +556,7 @@ SceneAnswer queryScene(SceneQuery asked)
      rayQueryEXT query;
      rayQueryInitializeEXT(query, sceneTop, asked.mFlags, asked.mMask, asked.mFrom, asked.mTmin, asked.mAlong, asked.mTmax);
  
@@ -327,7 +337,7 @@ index bb76c0e5..03c92bb8 100644
          ? rayKeyOf(rayQueryGetWorldRayOriginEXT(query), rayQueryGetWorldRayDirectionEXT(query))
          : 0u;
  
-@@ -930,9 +991,11 @@ float surfaceWithin(WorldRay ray, float tmin, float reach, Cone cone, RayRule ru
+@@ -930,9 +1001,11 @@ float surfaceWithin(WorldRay ray, float tmin, float reach, Cone cone, RayRule ru
      return withinOf(queryScene(surfaceWithinQuery(ray, tmin, reach, cone, rule)), reach);
  }
  
@@ -341,7 +351,7 @@ index bb76c0e5..03c92bb8 100644
  }
  
  /// What a ray found, resolved down to the inputs shading needs.
-@@ -1404,6 +1467,43 @@ Surface resolve(Hit hit, vec3 origin, vec3 direction, bool detailed)
+@@ -1404,6 +1477,43 @@ Surface resolve(Hit hit, vec3 origin, vec3 direction, bool detailed)
      surface.mAmbientAlbedo
          = lit ? min(surface.mAmbientAlbedo + sheet / SUNLIT_WHITE, vec3(1.0)) : surface.mAmbientAlbedo;
  
@@ -640,6 +650,116 @@ index cc9235d0..7d040bbd 100644
      run.mStep = RUN_IDLE;
  }
  
+diff --git i/components/rtxvulkan/shaders/trace/bounce.comp w/components/rtxvulkan/shaders/trace/bounce.comp
+index d4b03fe5..e35102e1 100644
+--- i/components/rtxvulkan/shaders/trace/bounce.comp
++++ w/components/rtxvulkan/shaders/trace/bounce.comp
+@@ -16,6 +16,8 @@
+ // **The trace's hit, resolved again with no traversal** (`storedSolidOf`): the surface the trace shaded, to
+ // the bit.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git i/components/rtxvulkan/shaders/trace/direct.comp w/components/rtxvulkan/shaders/trace/direct.comp
+index adaeef00..c5f590ce 100644
+--- i/components/rtxvulkan/shaders/trace/direct.comp
++++ w/components/rtxvulkan/shaders/trace/direct.comp
+@@ -18,6 +18,8 @@
+ // **The trace's hit, resolved again with no traversal** (`storedSolidOf`), as the bounce's stage resolves
+ // it.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "gbuffer.h"
+diff --git i/components/rtxvulkan/shaders/trace/fogscatter.rgen w/components/rtxvulkan/shaders/trace/fogscatter.rgen
+index a60e0623..d2355de7 100644
+--- i/components/rtxvulkan/shaders/trace/fogscatter.rgen
++++ w/components/rtxvulkan/shaders/trace/fogscatter.rgen
+@@ -292,5 +292,13 @@ void main()
+         FOG_HISTORY_ROUNDED_AT_RANDOM ? roundedToHalf(scatter, scatterRounding) : scatter)
+     RTX_STORE_COUNTED(fogSunwardTarget, froxel,
+         FOG_HISTORY_ROUNDED_AT_RANDOM ? roundedToHalf(sunward, sunwardRounding) : sunward)
+-    RTX_STORE_COUNTED(fogLampsTarget, froxel, vec4(lampScatter, 0.0))
++    // Lamp lighting uses RGB. Publish the pond marker in two alpha texels covered
++    // by the same scatter-to-sampling barrier as the lamps.
++    float pond = 0.0;
++    if (froxel.xy == ivec2(0) && froxel.z < 2 && !isinf(frame.mWaterLevel))
++    {
++        vec2 conditions = readPondMarker();
++        pond = froxel.z == 0 ? conditions.x : conditions.y;
++    }
++    RTX_STORE_COUNTED(fogLampsTarget, froxel, vec4(lampScatter, pond))
+ }
+diff --git i/components/rtxvulkan/shaders/trace/landing.comp w/components/rtxvulkan/shaders/trace/landing.comp
+index 690b2e5e..a50ead24 100644
+--- i/components/rtxvulkan/shaders/trace/landing.comp
++++ w/components/rtxvulkan/shaders/trace/landing.comp
+@@ -12,6 +12,8 @@
+ // **A stage apart from the bounce** (`BounceRun`), so no record of the bounce's is live through the
+ // landing's traversals.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git i/components/rtxvulkan/shaders/trace/media.comp w/components/rtxvulkan/shaders/trace/media.comp
+index bda05020..7f88ca1f 100644
+--- i/components/rtxvulkan/shaders/trace/media.comp
++++ w/components/rtxvulkan/shaders/trace/media.comp
+@@ -19,6 +19,8 @@
+ // **The trace's rays again, and not its columns stored**: the eye's ray from where the trace cast it, and
+ // for water the water's own walk up to the path's leg, which this stage marches.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git i/components/rtxvulkan/shaders/trace/panes.comp w/components/rtxvulkan/shaders/trace/panes.comp
+index 123628c0..dc744e22 100644
+--- i/components/rtxvulkan/shaders/trace/panes.comp
++++ w/components/rtxvulkan/shaders/trace/panes.comp
+@@ -15,6 +15,8 @@
+ //
+ // **Over the tiles the trace listed alone** (`STAGE_LIST_PANES`): where a layer stands.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git i/components/rtxvulkan/shaders/trace/unbounced.comp w/components/rtxvulkan/shaders/trace/unbounced.comp
+index 99e0ad0d..4c555bef 100644
+--- i/components/rtxvulkan/shaders/trace/unbounced.comp
++++ w/components/rtxvulkan/shaders/trace/unbounced.comp
+@@ -11,6 +11,8 @@
+ // its normals leaves every other fetch of `resolve` to the compiler to remove, and no list, gloss or lobe
+ // holds registers.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git i/components/rtxvulkan/shaders/trace/visibility.comp w/components/rtxvulkan/shaders/trace/visibility.comp
+index 1291e309..98748deb 100644
+--- i/components/rtxvulkan/shaders/trace/visibility.comp
++++ w/components/rtxvulkan/shaders/trace/visibility.comp
+@@ -18,6 +18,8 @@
+ // met the sea pending and lists its tile (`STAGE_LIST_WATER`), and the water's stage over those tiles,
+ // which takes each pending pixel's peel up where the trace stored it and walks its water.
+ 
++#define POND_FRAME_READY
++
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "shared/glare.h"
 diff --git i/components/rtxvulkan/shaders/trace/waverows.comp w/components/rtxvulkan/shaders/trace/waverows.comp
 index 4464eb78..67790239 100644
 --- i/components/rtxvulkan/shaders/trace/waverows.comp
