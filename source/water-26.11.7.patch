@@ -1,0 +1,903 @@
+diff --git a/components/rtxvulkan/shaders/lib/sea.glsl b/components/rtxvulkan/shaders/lib/sea.glsl
+index 65d555d5..945d97e0 100644
+--- a/components/rtxvulkan/shaders/lib/sea.glsl
++++ b/components/rtxvulkan/shaders/lib/sea.glsl
+@@ -20,8 +20,65 @@
+ #include "turns.glsl"
+ 
+ /// How far refraction deflects a ray, per unit of surface slope.
++// Stretch the swell horizontally while retaining its surface slopes.
++const float SWELL_WAVELENGTH_SCALE = 1.0;
++const float WATER_MOTION_STRENGTH = 0.1;
++
+ const float WATER_REFRACTION_BEND = 1.0 - 1.0 / WATER_IOR;
+ 
++// Rain and lily edges use the same capillary waveform. The lily footprint fixes
++// its phase in world space and supplies its own envelope along the pad edge.
++float capillaryCrest(float signedDistance)
++{
++    return cos((TAU / RAIN_RING_LENGTH) * signedDistance);
++}
++
++#extension GL_EXT_ray_tracing_position_fetch : require
++vec2 stationaryPadSlope(vec3 point, float footprint, out float contactShade)
++{
++    contactShade = 0.0;
++    float detail = resolved(RAIN_RING_LENGTH, footprint);
++    if (detail <= 0.0 || abs(point.z) > 8.0)
++        return vec2(0.0);
++
++    rayQueryEXT probe;
++    rayQueryInitializeEXT(probe, sceneTop, gl_RayFlagsNoOpaqueEXT, MASK_STATIC,
++        point - vec3(0, 0, 1250), 0.0, vec3(0, 0, -1), 1000.0);
++    vec2 slope = vec2(0.0);
++    while (rayQueryProceedEXT(probe))
++    {
++        if (rayQueryGetIntersectionTypeEXT(probe, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
++            continue;
++        vec3 corners[3];
++        rayQueryGetIntersectionTriangleVertexPositionsEXT(probe, false, corners);
++        if (all(lessThan(abs(vec3(corners[0].z, corners[1].z, corners[2].z)
++            - vec3(-1025.375)), vec3(0.001))))
++        {
++            vec2 uv = rayQueryGetIntersectionBarycentricsEXT(probe, false);
++            vec2 local = corners[0].xy * (1.0 - uv.x - uv.y) + corners[1].xy * uv.x + corners[2].xy * uv.y;
++            float outer = max(length(corners[0].xy), max(length(corners[1].xy), length(corners[2].xy)));
++            float radius = 1.42 * length(local) / max(outer, 0.001);
++            float shade = 1.0 - smoothstep(0.5, 1.42, radius);
++            contactShade = max(contactShade, 0.90 * shade * detail);
++            continue;
++        }
++        // Local depth identifies the buried footprint even if alpha state is optimized away.
++        if (any(greaterThan(abs(vec3(corners[0].z, corners[1].z, corners[2].z)
++            - vec3(-1024.375)), vec3(0.001))))
++            continue;
++        mat4x3 toWorld = rayQueryGetIntersectionObjectToWorldEXT(probe, false);
++        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(probe, false);
++        bool first = (rayQueryGetIntersectionPrimitiveIndexEXT(probe, false) & 1u) == 0u;
++        vec2 outward = (toWorld * vec4(corners[1] - corners[first ? 0 : 2], 0.0)).xy;
++        float width = max(length(outward), 0.001);
++        float across = first ? bary.x + bary.y : bary.x;
++        float envelope = (1.0 - smoothstep(0.35, 1.0, across)) * smoothstep(0.4, 3.0, width);
++        slope += (outward / width) * (0.35 * detail * RAIN_RING_STEEPNESS * envelope
++            * capillaryCrest(across * width));
++    }
++    return slope;
++}
++
+ /// What the rain adds to the water it lands on, as a slope beside the wave field's.
+ ///
+ /// **Rings from a lattice of impacts, the same trick the drops themselves use**: each cell of the water plane
+@@ -43,7 +100,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+ 
+     // Squared, because `detail` scales a slope and what `lost` accumulates is a mean square of one.
+     const float dropped = 1.0 - detail * detail;
+-    const float wavenumber = TAU / RAIN_RING_LENGTH;
++
+ 
+     vec2 slope = vec2(0.0);
+     const ivec2 base = ivec2(floor(at / RAIN_RING_CELL));
+@@ -63,7 +120,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+ 
+             // Where this impact is in its own life, which each cell keeps its own phase of so the
+             // whole surface does not ring at once.
+-            const float age = fract(turnsAt(1.0 / RAIN_RING_LIFE, frame.mWaterTime) + offset) * RAIN_RING_LIFE;
++            const float age = fract(turnsAt(WATER_ANIMATION_SPEED / RAIN_RING_LIFE, frame.mWaterTime) + offset) * RAIN_RING_LIFE;
+ 
+             const vec2 away = at - fell;
+             const float distance = length(away);
+@@ -82,7 +139,7 @@ vec2 rainSlope(vec2 at, float footprint, out float lost)
+             if (!(detail > 0.0))
+                 continue;
+ 
+-            slope += away / max(distance, 1.0e-4) * (detail * steepness * cos(wavenumber * (distance - front)));
++            slope += away / max(distance, 1.0e-4) * (detail * steepness * capillaryCrest(distance - front));
+         }
+ 
+     return slope;
+@@ -209,6 +266,7 @@ vec3 rippleHessian(vec2 at, float footprint)
+ /// moment of one height field, which must not be computed apart.
+ struct WaterSurface
+ {
++    float mPadShade;
+     /// Unit, from the gradient of the height field.
+     vec3 mNormal;
+ 
+@@ -223,8 +281,9 @@ struct WaterSurface
+ /// **Both come out of one fetch**, which is what the moments were composed into that texture for: `E[f^2] -
+ /// E[f]^2` off one level of one chain is the variance that level averaged away, where a filter applied here
+ /// would be a second opinion about the same field.
+-WaterSurface waterSurfaceAt(vec2 at, float footprint)
++WaterSurface waterSurfaceAt(vec3 waterPoint, float footprint)
+ {
++    vec2 at = waterPoint.xy;
+     WaterSurface surface;
+     surface.mLostSlope = 0.0;
+ 
+@@ -235,8 +294,8 @@ WaterSurface waterSurfaceAt(vec2 at, float footprint)
+     // multiples of one another, so the sum repeats only at a distance no frame contains.
+     [[unroll]] for (uint cascade = 0u; cascade < WAVE_CASCADES; ++cascade)
+     {
+-        const vec2 uv = waveCoordinate(cascade, at);
+-        const float level = waveLevel(cascade, footprint);
++        const vec2 uv = waveCoordinate(cascade, at / SWELL_WAVELENGTH_SCALE);
++        const float level = waveLevel(cascade, footprint / SWELL_WAVELENGTH_SCALE);
+ 
+         const vec3 field = textureLod(waveSurface[cascade], uv, level).xyz;
+ 
+@@ -255,6 +314,7 @@ WaterSurface waterSurfaceAt(vec2 at, float footprint)
+     // joins the spectrum's, because a cone that cannot resolve a ring lost real slope either way.
+     float rainLost;
+     slope += rainSlope(at, footprint, rainLost);
++    slope += stationaryPadSlope(waterPoint, footprint, surface.mPadShade);
+ 
+     surface.mLostSlope += rainLost;
+ 
+@@ -264,83 +324,124 @@ WaterSurface waterSurfaceAt(vec2 at, float footprint)
+ 
+     surface.mLostSlope += rippleLost;
+ 
+-    surface.mNormal = normalize(vec3(-slope, 1.0));
++    surface.mLostSlope *= WATER_MOTION_STRENGTH * WATER_MOTION_STRENGTH;
++    surface.mNormal = normalize(vec3(-slope * WATER_MOTION_STRENGTH, 1.0));
+     return surface;
+ }
+ 
+ /// How much the sunlight reaching `depth` below the surface has been gathered, as a multiplier.
+ ///
+-/// **Caustics are ray density**, and a change in density is the determinant of the Jacobian of the map from
+-/// where light met the surface to where it landed.
+-///
+-/// **One index of refraction and not three.** Water's runs 1.3326 to 1.3392 across the visible band (Cauchy),
+-/// so a real caustic has coloured edges; drawing them costs three determinants for a handful of pixels in a
+-/// hundred thousand that differ by more than one level. It would put prism edges on cusps if the surface got
+-/// steep enough for the determinant to approach zero, and goes in then.
+-///
+-/// @param at **where the light met the surface, and not where it landed.** The Jacobian belongs there, and
+-///        the caller has it already from the refracted path it charged for absorption. Read at the landing
+-///        point, the pattern cannot slide as the depth grows and the sun's direction never enters it: a
+-///        moon drew the sun's caustics, and a bed at two metres and one at thirty drew the same ones.
+-/// @param depth how far below the surface the light then travelled, in world units.
+-float caustic(vec2 at, float depth, float footprint)
++// A local water mesh projects sunlight onto the receiver's depth plane. Coordinates
++// below are in mesh cells relative to the receiver, so the area ratio is unitless.
++const vec3 CAUSTIC_WARMTH = vec3(1.0, 0.82, 0.61);
++
++vec2 projectedVertex(vec2 offset, vec2 entry, vec3 incident, vec3 flatRay, float height, float spacing)
+ {
+-    // Three numbers rather than four, because a Hessian is symmetric: xx, yy, and the shared
+-    // off-diagonal.
+-    vec3 hessian = vec3(0.0);
+-    float resolved = 0.0;
+-
+-    // **Three limits, and the largest wins.** The pixel's own cone; the blur two angles put on the pattern,
+-    // which grows with the depth; and the scale of the pattern itself, which grows as the *square root* of the
+-    // depth once the map has folded (Snyder and Dera's other half, a property of branching and not of blur),
+-    // which starts the change in the shallows where a linear term is still under one texel.
+-    const float blurred = depth * (WATER_CAUSTIC_SPREAD + WATER_REFRACTION_BEND * frame.mWaveSlope);
+-    const float branched = WATER_CAUSTIC_GRAIN * sqrt(depth / WATER_CAUSTIC_FOCUS);
+-    const float widened = max(footprint, max(blurred, branched));
+-
++    vec2 at = entry + offset * spacing;
++    vec2 slope = vec2(0.0);
+     [[unroll]] for (uint cascade = 0u; cascade < WAVE_CASCADES; ++cascade)
++        slope += textureLod(waveSurface[cascade], waveCoordinate(cascade, at * 3.0), waveLevel(cascade, spacing * 3.0)).xy;
++    float unresolved;
++    // Resolve the short ripples that focus sunlight in the pond shallows.
++    // Limit the gain in calm conditions so a flat surface stays flat.
++    slope = seaWorld(slope) * min(4.0, 0.24 / max(frame.mWaveSlope, 0.001))
++        + rippleSlope(at, spacing, unresolved);
++    // Intersecting short surface waves provide curvature in both directions in calm shallows.
++    vec2 local = seaLocal(at);
++    vec2 dirA = vec2(0.6, 0.8), dirB = vec2(-0.8, 0.6);
++    float a = dot(local, dirA) / 13.0 + turnsAt(0.42, frame.mWaterTime);
++    float b = dot(local, dirB) / 17.0 + turnsAt(0.33, frame.mWaterTime);
++    slope += seaWorld(0.20 * dirA * cos(TAU * fract(a)) + 0.18 * dirB * cos(TAU * fract(b)));
++    vec3 normal = normalize(vec3(-slope, 1.0));
++    vec3 ray = height > 0.0 ? reflect(incident, normal) : refract(incident, normal, 1.0 / WATER_IOR);
++    float z = height > 0.0 ? max(ray.z, 0.06) : min(ray.z, -0.06);
++    vec2 drift = (ray.xy / z - flatRay.xy / flatRay.z) * (height / spacing);
++    // Limit extreme grazing displacements to the neighbourhood evaluated below.
++    return offset + drift / sqrt(1.0 + dot(drift, drift));
++}
++
++float cross2D(vec2 a, vec2 b)
++{
++    return a.x * b.y - a.y * b.x;
++}
++
++float patchLight(vec2 a, vec2 b, vec2 c, float blur)
++{
++    // A triangle's solid angle integrates a soft footprint over its interior.
++    // Shared edges then partition the footprint exactly, even at six-way vertices.
++    vec3 u = vec3(a, blur), v = vec3(b, blur), w = vec3(c, blur);
++    float area = abs(cross2D(b - a, c - a));
++    float lu = length(u), lv = length(v), lw = length(w);
++    float denominator = lu * lv * lw + dot(u, v) * lw + dot(v, w) * lu + dot(w, u) * lv;
++    float coverage = atan(blur * area, denominator) / 3.14159265;
++    return coverage / max(area, 1e-6);
++}
++
++float caustic(vec2 entry, float height, float footprint, vec3 toward, float limb)
++{
++    const float spacing = 2.0;
++    // Half frequency along the swell doubles the length while retaining its width.
++    entry = seaWorld(seaLocal(entry) * vec2(0.5, 1.0));
++    float depth = abs(height);
++    float cone = max(footprint, depth * limb) / spacing;
++    float baseWidth = sqrt(0.23 * 0.23 + cone * cone);
++    float core = height < 0.0 ? sqrt(0.32 * 0.32 + cone * cone) : baseWidth;
++    float feather = height < 0.0 ? 5.0 * baseWidth : baseWidth;
++    float detail = (1.0 - smoothstep(0.65, 1.5, cone)) * smoothstep(0.02, 0.12, toward.z);
++    if (detail <= 0.0)
++        return 1.0;
++    vec3 incident = -toward;
++    vec3 flatRay = height > 0.0 ? reflect(incident, vec3(0,0,1)) : refract(incident, vec3(0,0,1), 1.0 / WATER_IOR);
++    ivec2 cell = ivec2(floor(entry / spacing));
++    vec2 start = -fract(entry / spacing) - 1.0;
++    vec2 row[4];
++    for (int x = 0; x < 4; ++x)
++        row[x] = projectedVertex(start + vec2(x, 0), entry, incident, flatRay, height, spacing);
++    float light = 0.0;
++    float softLight = 0.0;
++    float folded = 0.0;
++    for (int y = 1; y <= 3; ++y)
+     {
+-        const vec2 uv = waveCoordinate(cascade, at);
+-        const float level = waveLevel(cascade, widened);
+-
+-        hessian += textureLod(waveCurvature[cascade], uv, level).xyz;
+-        resolved += resolvedShare(cascade, level);
++        vec2 left = projectedVertex(start + vec2(0, y), entry, incident, flatRay, height, spacing);
++        for (int x = 1; x <= 3; ++x)
++        {
++            vec2 right = projectedVertex(start + vec2(x, y), entry, incident, flatRay, height, spacing);
++            // Rotate the corner order on alternate world-grid cells, preserving winding.
++            bool flip = ((cell.x + cell.y + x + y) & 1) != 0;
++            vec2 a = flip ? row[x] : row[x-1];
++            vec2 b = flip ? right : row[x];
++            vec2 c = flip ? left : right;
++            vec2 d = flip ? row[x-1] : left;
++            float first = patchLight(a, b, c, core);
++            float second = patchLight(a, c, d, core);
++            light += first + second;
++            if (height < 0.0)
++                softLight += patchLight(a, b, c, feather) + patchLight(a, c, d, feather);
++            // Reversed triangles identify overlapping ray paths at optical folds.
++            if (cross2D(b - a, c - a) < 0.0)
++                folded += first;
++            if (cross2D(c - a, d - a) < 0.0)
++                folded += second;
++            row[x-1] = left;
++            left = right;
++        }
++        row[3] = left;
+     }
+-
+-    // A wake's rings are a Hessian like any swell's, read at the same width, but laid in the world's frame:
+-    // the tiles' sum is turned into it first, as their slope is.
+-    hessian = seaWorldHessian(hessian) + rippleHessian(at, widened);
+-
+-    // One determinant and not a ratio of two, because this surface is not displaced: the quad stays flat
+-    // and only its normal moves, so the patch of surface the light left is the patch of parameter space it
+-    // came from.
+-
+-    // Rising with the depth to the fold and held there: `bend * rms curvature` reaches one at the
+-    // focus, which is where a lens is at its strongest and where one Jacobian stops describing what
+-    // is behind it. The fade below carries the depth from there on.
+-    const float toward = WATER_CAUSTIC_FOLD * min(depth / WATER_CAUSTIC_FOCUS, 1.0);
+-    const float bend = toward * inversesqrt(max(frame.mWaveCurvature, 1.0e-12));
+-    const float determinant
+-        = (1.0 - bend * hessian.x) * (1.0 - bend * hessian.y) - bend * bend * hessian.z * hessian.z;
+-
+-    // **A reciprocal of something that fluctuates is worth more than the reciprocal of its mean**, and left
+-    // alone that is a bed lit brighter than the water over it lets through.
+-    //
+-    // **How far the map has folded at the level this pixel reads, which is not `toward`.** `bend` is sized
+-    // against the sea's whole curvature and the Hessian above is only what the cone resolved, so the fold is
+-    // `toward` scaled by the share still resolved; it goes to nought as the cone reaches the coarse levels,
+-    // where a surface averaged flat has no gain to remove.
+-    const float fold = toward * sqrt(resolved);
+-    const float gathered = 1.0 / (max(abs(determinant), 1.0 / WATER_CAUSTIC_MAX) * causticGain(fold));
+-
+-    // **Snyder and Dera's law, and the whole of why deep water has none of this.** Past the focus a point on
+-    // the bed is reached by several patches of surface at once and this draws one, the rest averaging to the
+-    // mean, so the pattern fades as a power of the depth, which the sea measures at a half and
+-    // `WATER_CAUSTIC_FADE` sets to one for the reason it gives.
+-
+-    const float shown = WATER_CAUSTIC_STRENGTH * pow(max(depth / WATER_CAUSTIC_FOCUS, 1.0), -WATER_CAUSTIC_FADE);
+-
+-    return 1.0 + (gathered - 1.0) * shown;
++    // Replace the soft filter tail outside the local mesh with neutral illumination.
++    vec2 end = start + 3.0;
++    float covered = 9.0 * (patchLight(start, vec2(end.x, start.y), end, core)
++        + patchLight(start, end, vec2(start.x, end.y), core));
++    float focus = light + 1.0 - covered;
++    float glint = smoothstep(1.08, 1.9, focus) * max(smoothstep(0.015, 0.22, folded), smoothstep(1.4, 2.1, focus));
++    float body = focus;
++    if (height < 0.0)
++    {
++        float softCovered = 9.0 * (patchLight(start, vec2(end.x, start.y), end, feather)
++            + patchLight(start, end, vec2(start.x, end.y), feather));
++        body = softLight + 1.0 - softCovered;
++        glint *= smoothstep(1.15, 1.85, focus);
++    }
++    return mix(1.0, max(0.05, 1.0 + 2.0 * (body - 1.0)) + 1.4 * glint, detail);
+ }
+ 
+ #endif
+diff --git a/components/rtxvulkan/shaders/lib/shading.glsl b/components/rtxvulkan/shaders/lib/shading.glsl
+index 793023e3..366e852e 100644
+--- a/components/rtxvulkan/shaders/lib/shading.glsl
++++ b/components/rtxvulkan/shaders/lib/shading.glsl
+@@ -92,7 +92,7 @@ SkyTerm skyTermOf(SkyChoice choice, vec3 position, float footprint, Gloss gloss)
+ 
+     const vec3 water = lightThroughWater(
+         bentPathAt(position, sunUnderWater(choice.mSky.mDirection)), footprint,
+-        waterCrossingOf(choice.mSky.mDirection).mInto);
++        waterCrossingOf(choice.mSky.mDirection).mInto, choice.mSky);
+     const vec3 diffuse = choice.mSky.mIrradiance * water * (choice.mCosine * INV_PI);
+     return SkyTerm(diffuse, gloss.mGlossy ? diffuse * choice.mLight.mFresnel : vec3(0.0),
+         gloss.mGlossy ? water * choice.mLight.mSpecular : vec3(0.0));
+@@ -522,12 +522,47 @@ vec3 liftOf(Surface surface)
+ ///        arrives from everything that is not a light — `pathEnd` at the hit a hemisphere found — or
+ ///        whichever part of that the caller has not handed to a filter.
+ /// @param specular what the lobe reflects toward the eye, whole.
++float causticDaylight()
++{
++    float disc = max(frame.mSunDiscColour.r, max(frame.mSunDiscColour.g, frame.mSunDiscColour.b));
++    return frame.mAmbientFromSky * smoothstep(0.0, 0.10, frame.mSun.mDirection.z)
++        * smoothstep(0.0, 0.12, disc);
++}
++
+ vec3 litSurface(Surface surface, vec3 diffuse, vec3 specular)
+ {
+     // The emissive colour joins the light rather than the albedo, which is where the original engine puts
+     // it: it sums the term with the diffuse and ambient light and multiplies the whole by the texture
+     // (`files/shaders/compatibility/objects.frag:232`).
+-    return surface.mAlbedo * (diffuse + surface.mEmissiveColour * EMISSIVE_INTENSITY) + surface.mEmitted + specular;
++    vec3 glow = surface.mEmitted;
++    float height = surface.mPosition.z - frame.mWaterLevel;
++    float sun = causticDaylight();
++    if (HAS_SEA && sun > 0.0 && height > -64.0 && height < 128.0)
++    {
++        vec3 travel = height > 0.0 ? reflect(-frame.mSun.mDirection, vec3(0, 0, 1))
++                                   : sunUnderWater(frame.mSun.mDirection).mTravelling;
++        float incidence = max(dot(surface.mGeometric, -travel), 0.0);
++        float distance = height / travel.z;
++        if (incidence > 0.0 && distance > 0.25 && distance < 240.0)
++        {
++            vec3 entry = surface.mPosition - distance * travel;
++            WorldRay probe = WorldRay(leaveSurface(surface.mPosition, stepOf(surface), -travel), -travel);
++            SceneAnswer hit = queryScene(surfaceWithinQuery(probe, 0.0, distance + 8.0,
++                Cone(surface.mFootprint, 0.0), RayRule(solidMask(frame.mRayMask) | MASK_WATER, MEET_BY_CHANCE, false)));
++            if (hit.mCommitted != 0u && hit.mKind == KIND_WATER)
++            {
++                float focus = max(caustic(entry.xy, height, surface.mFootprint, frame.mSun.mDirection, frame.mSun.mLimb) - 1.0, 0.0);
++                float fade = height > 0.0 ? 1.0 - smoothstep(70.0, 128.0, height)
++                                          : 1.0 - smoothstep(48.0, 64.0, -height);
++                vec3 tint = height > 0.0 ? vec3(1.0) : waterTransmittance(distance);
++                vec3 atWater = probe.mFrom + hit.mDistance * probe.mAlong;
++                float visible = throughAnswered(answerAsked(skyAsk(frame.mSun, atWater + vec3(0, 0, 0.2), vec3(0), vec2(0.5), false)));
++                glow += mix(vec3(0.25), vec3(1.0), surface.mAlbedo) * frame.mSun.mIrradiance * tint
++                    * (sun * visible * fade * focus * incidence * 0.21) * CAUSTIC_WARMTH;
++            }
++        }
++    }
++    return surface.mAlbedo * (diffuse + surface.mEmissiveColour * EMISSIVE_INTENSITY) + glow + specular;
+ }
+ 
+ /// What a surface sends back, with the shadowed sources kept apart: `CHANNEL_SHADOWED`'s and
+diff --git a/components/rtxvulkan/shaders/lib/traversal.glsl b/components/rtxvulkan/shaders/lib/traversal.glsl
+index 0fb1372b..ebadc0aa 100644
+--- a/components/rtxvulkan/shaders/lib/traversal.glsl
++++ b/components/rtxvulkan/shaders/lib/traversal.glsl
+@@ -26,6 +26,75 @@
+ #include "texturing.glsl"
+ #include "variants.glsl"
+ 
++#include "frame.glsl"
++#include "turns.glsl"
++
++// A hidden, alpha-rejected triangle follows the player. Lua encodes the settled
++// sediment fraction in its height and the time/weather factor in its rotation.
++vec2 readPondMarker()
++{
++    vec3 start = vec3(frame.mOrigin.xy, frame.mWaterLevel - 2900.0);
++    rayQueryEXT query;
++    rayQueryInitializeEXT(query, sceneTop, gl_RayFlagsNoOpaqueEXT, MASK_STATIC,
++        start, 0.0, vec3(0, 0, -1), 250.0);
++    while (rayQueryProceedEXT(query))
++    {
++        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT)
++            continue;
++        vec3 corners[3];
++        rayQueryGetIntersectionTriangleVertexPositionsEXT(query, false, corners);
++        if (all(equal(vec3(corners[0].z, corners[1].z, corners[2].z), vec3(-3.375))))
++        {
++            mat4x3 placement = rayQueryGetIntersectionObjectToWorldEXT(query, false);
++            return clamp(vec2((placement[3].z - frame.mWaterLevel + 3072.0) / 64.0,
++                abs(placement[0].x)), 0.0, 1.0);
++        }
++    }
++    return vec2(0.0);
++}
++
++vec2 pondConditions()
++{
++#ifdef POND_FRAME_READY
++    return vec2(imageLoad(fogColumnMoons, ivec3(0)).a, imageLoad(fogColumnMoons, ivec3(0, 0, 1)).a);
++#else
++    return readPondMarker();
++#endif
++}
++
++vec2 sedimentGradient(ivec2 cell)
++{
++    uint seed = steppedKey(pixelKey(uvec2(cell)));
++    float angle = TAU * randomNext(seed);
++    return vec2(cos(angle), sin(angle));
++}
++
++float sedimentNoise(vec2 p)
++{
++    ivec2 i = ivec2(floor(p));
++    vec2 f = fract(p);
++    vec2 w = f*f*f*(f*(f*6.0-15.0)+10.0);
++    return mix(mix(dot(sedimentGradient(i), f), dot(sedimentGradient(i+ivec2(1,0)), f-vec2(1,0)), w.x),
++               mix(dot(sedimentGradient(i+ivec2(0,1)), f-vec2(0,1)),
++                   dot(sedimentGradient(i+ivec2(1)), f-vec2(1)), w.x), w.y);
++}
++
++// Depth in world units. Both edges span thirty times their former depth range.
++float pondTanninAt(float depth)
++{
++    const float peak = 30.0 * 2.0 * WATER_SHORE_FADE;
++    const float shallow = depth / (depth + WATER_SHORE_FADE);
++    const float onset = mix(smoothstep(0.0, peak, depth), shallow * shallow, 0.85);
++    return onset * (1.0 - smoothstep(peak, 30.0 * 192.0, depth));
++}
++
++// Change HSV saturation while preserving the value channel.
++vec3 pondSaturate(vec3 rgb, float gain)
++{
++    float value = max(rgb.r, max(rgb.g, rgb.b));
++    return max(vec3(0.0), vec3(value) + gain * (rgb - value));
++}
++
+ /// The shortest distance to a light worth a ray, in world units: a light nearer the point than this
+ /// is one nothing can stand between. **Not where a ray starts**, which is `leaveSurface`'s.
+ const float SHADOW_BIAS = 1.0;
+@@ -415,6 +484,19 @@ const uint MEET_BY_CHANCE = 1u;
+ /// itself (`visibility.comp`), and by a falling drop's shelter ray, since glass keeps rain off as a
+ /// roof does.
+ const uint MEET_AS_SOLID = 2u;
++const uint MEET_SHORE_BED = 3u;
++
++// Monet pads carry a distinctive emissive material swatch, decoded from sRGB.
++bool isPondPad(vec3 emission)
++{
++    return emission.r > 0.99 && emission.g == 0.0 && abs(emission.b - 0.05127) < 0.002;
++}
++
++// The koi material carries this near-white ambient tint on both animated pieces.
++bool isPondKoi(GpuMaterial material)
++{
++    return all(lessThan(abs(material.mAmbientColour - decodeSrgb(vec3(0.98, 0.96, 0.99))), vec3(0.0002)));
++}
+ 
+ /// A key a ray draws from, made of the ray itself: where it leaves and which way, so two rays a
+ /// pixel apart or a frame apart draw apart without a pixel's key handed down every traversal.
+@@ -453,10 +535,13 @@ bool candidateStops(Candidate candidate, TriangleEdges edges, vec3 direction, fl
+     const GpuInstance instance = instanceAt(candidate.mInstance);
+     const GpuMaterial material = materialAt(instance.mMaterial);
+ 
++    if (meet == MEET_SHORE_BED && (isPondKoi(material) || isPondPad(material.mEmissiveColour)))
++        return false;
++
+     const float opacity = surfaceOpacity(instance, material);
+     const bool seenThrough = isSeenThrough(opacity, material);
+     const bool walkPast = meet == MEET_WALK_PAST && seenThrough;
+-    const bool byChance = meet == MEET_BY_CHANCE && seenThrough;
++    const bool byChance = (meet == MEET_BY_CHANCE || meet == MEET_SHORE_BED) && seenThrough;
+ 
+     // **Nothing stops on a medium, whatever the ray was asking.** A surface that is nowhere opaque is not a
+     // surface: the eye walks through a cloud and commits the mountain behind it, and a bounce does the
+@@ -595,7 +680,7 @@ SceneAnswer queryScene(SceneQuery asked)
+     rayQueryEXT query;
+     rayQueryInitializeEXT(query, sceneTop, asked.mFlags, asked.mMask, asked.mFrom, asked.mTmin, asked.mAlong, asked.mTmax);
+ 
+-    const uint rayKey = asked.mMeet == MEET_BY_CHANCE
++    const uint rayKey = (asked.mMeet == MEET_BY_CHANCE || asked.mMeet == MEET_SHORE_BED)
+         ? rayKeyOf(rayQueryGetWorldRayOriginEXT(query), rayQueryGetWorldRayDirectionEXT(query))
+         : 0u;
+ 
+@@ -1102,9 +1187,11 @@ float eyeViewEnds(WorldRay ray, Cone cone)
+     return surfaceWithin(ray, 0.0, frame.mFar, cone, RayRule(worldMask(frame.mRayMask), MEET_WALK_PAST, true));
+ }
+ 
+-RayAsk solidWithinAsk(WorldRay ray, float tmin, float reach, Cone cone)
++RayAsk shoreBedAsk(WorldRay ray, float tmin, float reach, Cone cone)
+ {
+-    return rayOf(surfaceWithinQuery(ray, tmin, reach, cone, RayRule(solidMask(frame.mRayMask), MEET_BY_CHANCE, false)));
++    SceneQuery probe = surfaceWithinQuery(ray, tmin, reach, cone, RayRule(solidMask(frame.mRayMask), MEET_SHORE_BED, false));
++    probe.mFlags |= gl_RayFlagsNoOpaqueEXT;
++    return rayOf(probe);
+ }
+ 
+ /// What a ray found, resolved down to the inputs shading needs.
+@@ -1818,6 +1905,40 @@ Surface resolve(Hit hit, vec3 origin, vec3 direction, bool detailed, uint normal
+     surface.mAmbientAlbedo
+         = lit ? min(surface.mAmbientAlbedo + sheet / SUNLIT_WHITE, vec3(1.0)) : surface.mAmbientAlbedo;
+ 
++    vec3 colour = surface.mAlbedo;
++    vec3 glow = surface.mEmitted;
++    vec3 emission = surface.mEmissiveColour;
++    bool pad = isPondPad(emission);
++    float depth = waterOver(surface.mPosition);
++    if (pad)
++    {
++        emission = vec3(0.0);
++        if (surface.mGeometric.z < -0.2 && HAS_SEA && !isinf(frame.mWaterLevel))
++            glow += 0.12 * pondSaturate(colour, 2.50) * pondConditions().y;
++    }
++    else if (depth > 0.0)
++    {
++        colour = pondSaturate(colour, 1.0 + 0.94 * pondTanninAt(depth));
++        float sediment = surface.mGround && depth < 192.0 ? pondConditions().x : 0.0;
++        if (sediment > 0.0)
++        {
++            vec2 drift = phasorAt(turnsAt(0.013, frame.mWaterTime));
++            // Integrate two layers just above the bed along the viewing ray.
++            float lift = min(depth, 16.0 * sediment);
++            vec3 travel = -surface.mIncident * lift / max(abs(surface.mIncident.z), 0.25);
++            vec2 p = (surface.mPosition.xy + 0.25 * travel.xy) / 55.0;
++            vec2 upper = (surface.mPosition.xy + 0.75 * travel.xy) / 55.0;
++            float cloud = smoothstep(-0.45, 0.45, sedimentNoise(p + drift)
++                + 0.40 * sedimentNoise(upper * 2.3 - drift));
++            float haze = sediment * cloud * smoothstep(0.0, 8.0, depth)
++                * (1.0 - smoothstep(144.0, 192.0, depth));
++            colour = mix(colour, vec3(0.17, 0.087, 0.037), 0.72 * haze);
++        }
++    }
++    surface.mAmbientAlbedo = max(vec3(0.0), surface.mAmbientAlbedo + colour - surface.mAlbedo);
++    surface.mAlbedo = colour;
++    surface.mEmitted = glow;
++    surface.mEmissiveColour = emission;
+     return surface;
+ }
+ 
+diff --git a/components/rtxvulkan/shaders/lib/turns.glsl b/components/rtxvulkan/shaders/lib/turns.glsl
+index d3979997..ab59ff51 100644
+--- a/components/rtxvulkan/shaders/lib/turns.glsl
++++ b/components/rtxvulkan/shaders/lib/turns.glsl
+@@ -1,6 +1,9 @@
+ #ifndef OPENMW_COMPONENTS_RTXVULKAN_SHADERS_LIB_TURNS_GLSL
+ #define OPENMW_COMPONENTS_RTXVULKAN_SHADERS_LIB_TURNS_GLSL
+ 
++// Time scale for the animated swell and rain rings.
++const float WATER_ANIMATION_SPEED = 0.18;
++
+ #include "scene.h"
+ 
+ /// How far into its turn something that turns `rate` times a second is, `seconds` after nought: the
+diff --git a/components/rtxvulkan/shaders/lib/underwater.glsl b/components/rtxvulkan/shaders/lib/underwater.glsl
+index f0eedc97..0f211f2b 100644
+--- a/components/rtxvulkan/shaders/lib/underwater.glsl
++++ b/components/rtxvulkan/shaders/lib/underwater.glsl
+@@ -21,9 +21,18 @@
+ #include "traversal.glsl"
+ 
+ /// What a path of water this long leaves of the light crossing it, per channel.
++vec3 darkWaterScatter()
++{
++    const vec3 tint = frame.mWaterScatter;
++    const float grey = dot(tint, vec3(0.2126, 0.7152, 0.0722));
++    return 0.15 * mix(tint, vec3(grey), 0.35);
++}
++
+ vec3 waterTransmittance(float path)
+ {
+-    return exp(-WATER_EXTINCTION * path);
++    // Absorb more green and blue to soften the turquoise cast in transmitted light.
++    const vec3 extinction = mix(WATER_EXTINCTION, vec3(WATER_EXTINCTION.x), 0.35);
++    return exp(-(extinction + vec3(0.0025)) * path);
+ }
+ 
+ /// What is left of the daylight by the time it reaches a point, as a fraction per channel.
+@@ -82,6 +91,11 @@ BentPath bentPathAt(vec3 position, SunUnderWater bent)
+     return BentPath(depth, bent.mTravelling, path, position.xy - bent.mTravelling.xy * path);
+ }
+ 
++vec3 warmCaustic(float light)
++{
++    return vec3(min(light, 1.0)) + CAUSTIC_WARMTH * max(light - 1.0, 0.0);
++}
++
+ /// What a light in the sky has left, and how it has been gathered, by the time it reaches a point.
+ ///
+ /// **The direction is asked for rather than read off the sun**, because a moon is above the water too and
+@@ -90,15 +104,15 @@ BentPath bentPathAt(vec3 position, SunUnderWater bent)
+ ///
+ /// @param bent the light's path to the point.
+ /// @param into what the surface lets in of the light, `WaterCrossing::mInto`.
+-vec3 lightThroughWater(BentPath bent, float footprint, float into)
++vec3 lightThroughWater(BentPath bent, float footprint, float into, SkySource source)
+ {
+     if (!(bent.mDepth > 0.0))
+         return vec3(1.0);
+ 
+-    // **Read for the lens where the light met the surface, which is up-sun of where it landed**:
+-    // the point whose curvature focused it — and the whole of what makes a caustic move with the
+-    // depth and with the light rather than sitting still under the bed.
+-    return waterTransmittance(bent.mPath) * (caustic(bent.mMet, bent.mDepth, footprint) * into);
++    const float tint = pondTanninAt(bent.mDepth);
++    const vec3 stained = mix(vec3(1.0), vec3(0.28, 0.15, 0.025), tint);
++    const float entry = mix(1.0, into, smoothstep(0.0, 2.0 * WATER_SHORE_FADE, bent.mDepth));
++    return stained * waterTransmittance(bent.mPath) * (warmCaustic(caustic(bent.mMet, -bent.mDepth, footprint, source.mDirection, source.mLimb)) * entry);
+ }
+ 
+ /// What the world leaves of a light in the sky at a point, asked along the path the light took: under the
+@@ -271,7 +285,7 @@ vec3 beamAlong(SkySource source, vec3 from, vec3 direction, float path)
+     const SunUnderWater bent = sunUnderWater(source.mDirection);
+     const vec3 toward = source.mIrradiance * waterCrossingOf(source.mDirection).mBeam
+         * henyeyGreenstein(WATER_ASYMMETRY, -dot(direction, bent.mTravelling));
+-    return frame.mWaterScatter * toward * waterTransmittance(bent.mSlant * waterOver(from))
++    return darkWaterScatter() * toward * waterTransmittance(bent.mSlant * waterOver(from))
+         * gatheredAlong(direction, bent.mSlant, path);
+ }
+ 
+@@ -329,9 +343,12 @@ ColumnStart columnStartOf(vec3 from, vec3 direction, float path)
+     // **The sky's closed form at the ray's own angle**, `k` one: the sky arrives from above,
+     // through the column over each point. Looking straight down, `g` is two and this is the
+     // `(1 - T^2) / 2` it was for every ray; level, it is `1 - T`, and looking up it gathers more.
+-    const vec3 transmittance = waterTransmittance(path);
++    // Linear exposure of the view through water. Fade at contact with the bank.
++    // The luminance of the warm gain is 0.30 for neutral incident light.
++    const vec3 viewGain = mix(vec3(1.0), vec3(0.40, 0.28, 0.18), smoothstep(0.0, 6.0, path));
++    const vec3 transmittance = waterTransmittance(path) * viewGain;
+     const vec3 sky
+-        = frame.mWaterScatter * gatheredAlong(direction, 1.0, path) * frame.mWaterAmbient * daylightReaching(from);
++        = darkWaterScatter() * gatheredAlong(direction, 1.0, path) * frame.mWaterAmbient * daylightReaching(from);
+ 
+     // **Every light in the sky, as a surface's `GatherRun` walks them**, so the water in front of a
+     // bed a moon lights is lit by the same moon. A moon's beam is the closed form alone: the
+@@ -344,11 +361,11 @@ ColumnStart columnStartOf(vec3 from, vec3 direction, float path)
+     // The same test `fogAlong` makes before it spends anything on shafts: an interior and a night
+     // both answer no, and `mSun.mIrradiance` fades to nought across dusk rather than stepping.
+     if (!sunUp())
+-        return ColumnStart(transmittance, sky + moons, vec3(0.0), 0.0, false);
++        return ColumnStart(transmittance, (sky + moons) * viewGain, vec3(0.0), 0.0, false);
+ 
+     const vec3 beam = beamAlong(frame.mSun, from, direction, path);
+     const float share = brightest(beam) / max(brightest(sky + moons + beam), 1.0e-9);
+-    return ColumnStart(transmittance, sky + moons, beam, share, !(share < WATER_SHAFT_FLOOR));
++    return ColumnStart(transmittance, (sky + moons) * viewGain, beam * viewGain, share, !(share < WATER_SHAFT_FLOOR));
+ }
+ 
+ /// The column the closed forms give with the sun's beam scaled by `ratio`, what a march found the shafts
+@@ -458,7 +475,7 @@ void startShaftStep(inout ColumnRun run, inout SkyPassageRun skyPassage)
+     const vec2 draw = fract(run.mAimed + float(run.mShaft) * R2_STEPS);
+     skyPassage = skyPassageRunOf(skySourceAt(SKY_SOURCE_SUN), at, vec3(0.0), bent, draw, false);
+ 
+-    run.mLensed = weight * mix(1.0, caustic(bent.mMet, bent.mDepth, run.mFootprint), run.mShow);
++    run.mLensed = weight * mix(vec3(1.0), warmCaustic(caustic(bent.mMet, -bent.mDepth, run.mFootprint, frame.mSun.mDirection, frame.mSun.mLimb)), run.mShow);
+     run.mPlain += weight;
+     run.mBehind = ahead;
+ }
+diff --git a/components/rtxvulkan/shaders/lib/water.glsl b/components/rtxvulkan/shaders/lib/water.glsl
+index 00445d6b..257d2bc0 100644
+--- a/components/rtxvulkan/shaders/lib/water.glsl
++++ b/components/rtxvulkan/shaders/lib/water.glsl
+@@ -93,6 +93,7 @@ uint waterFieldOf(uvec2 pixel)
+ /// for the media stage a walk of its own (`ColumnRun`), as the step's purpose says (`stepWater`).
+ struct WaterRun
+ {
++    float mPadTransmission;
+     /// `RUN_IDLE` once the answer below is whole.
+     uint mStep;
+ 
+@@ -178,6 +179,7 @@ WaterRun waterRunOf(vec3 incident, Cone cone, uint field)
+     run.mPathLobe = 0.0;
+     run.mFound = false;
+     run.mDistance = 0.0;
++    run.mPadTransmission = 1.0;
+     run.mWeight = vec3(0.0);
+     run.mScattered = vec3(0.0);
+     run.mMissed = vec3(0.0);
+@@ -198,12 +200,32 @@ struct WaterShares
+ 
+ WaterShares waterSharesOf(WaterRun run)
+ {
+-    const float split = run.mSplit ? 2.0 : 1.0;
++    const float split = (run.mSplit ? 2.0 : 1.0) * run.mPadTransmission;
+     const float fresnel = run.mFresnel;
+     return run.mMirror ? WaterShares(0.0, split * fresnel * run.mShore)
+                        : WaterShares(split * (1.0 - run.mShore), split * (1.0 - fresnel) * run.mShore);
+ }
+ 
++// As rain intensifies, suspended silt spreads across the transmitted view.
++void applyRainSilt(inout WaterRun run, WaterShares shares)
++{
++    if (run.mMirror || run.mFromBelow)
++        return;
++    float sediment = pondConditions().x;
++    if (sediment <= 0.0)
++        return;
++    vec2 p = run.mPosition.xy / 55.0;
++    vec2 drift = phasorAt(turnsAt(0.013, frame.mWaterTime));
++    float cloud = smoothstep(-0.45, 0.45, sedimentNoise(p + drift)
++        + 0.4 * sedimentNoise(2.3 * p - drift));
++    float coverage = sediment * mix(cloud, 1.0, sediment);
++    float haze = 0.72 * coverage;
++    vec3 silt = vec3(0.17, 0.087, 0.037) * frame.mWaterAmbient;
++    run.mWeight *= 1.0 - haze;
++    run.mScattered = mix(run.mScattered, (shares.mWhole + shares.mThrough) * silt, haze);
++    run.mShafts *= 1.0 - haze;
++}
++
+ /// The ray the path follows from the water, asked once the shore is known: drawn, because a reflection is a
+ /// picture of the world and shows the faces the world shows, from where it left and no further — the origin
+ /// already stands off the plane (`leaveSurface`). Made again from the run by the stage that resolves what it
+@@ -235,7 +257,7 @@ void stepWater(
+ 
+         // Keyed off world position rather than anything interpolated, so one cell's surface continues
+         // into the next without a seam at the boundary.
+-        const WaterSurface sea = waterSurfaceAt(at.mPosition.xy, at.mFootprint);
++        const WaterSurface sea = waterSurfaceAt(at.mPosition, at.mFootprint);
+ 
+         // **The lost slopes as a roughness, the one a painted map states.** The cone they widen a
+         // reflection by is the lobe's own, as a solid's is, and never wider than a diffuse bounce's.
+@@ -262,6 +284,7 @@ void stepWater(
+         countNotFinite(normal);
+         run.mResponse = SurfaceResponse(packSurfaceNormal(normal), vec3(0.0), vec3(0.0), vec3(1.0));
+ 
++        run.mPadTransmission = fromBelow ? 1.0 : 1.0 - sea.mPadShade;
+         run.mFromBelow = fromBelow;
+         run.mNormal = normal;
+         run.mLobe = lobe;
+@@ -291,7 +314,7 @@ void stepWater(
+             const vec3 down = vec3(0.0, 0.0, -1.0);
+             const vec3 below = leaveSurface(at.mPosition, plane * at.mRounding, down);
+             run.mClearing = at.mPosition.z - below.z;
+-            ask = solidWithinAsk(WorldRay(below, down), 0.0, WATER_SHORE_FADE - run.mClearing,
++            ask = shoreBedAsk(WorldRay(below, down), 0.0, WATER_SHORE_FADE - run.mClearing,
+                 Cone(at.mFootprint, run.mCone.mSpread));
+         }
+         run.mStep = WATER_SHORE;
+@@ -365,6 +388,7 @@ void stepWater(
+             run.mMarches = start.mMarches;
+             run.mWeight = vec3(shares.mWhole) + shares.mThrough * under.mTransmittance;
+             run.mScattered = shares.mThrough * under.mScattered;
++            applyRainSilt(run, shares);
+             run.mStep = RUN_IDLE;
+             return;
+         }
+@@ -383,6 +407,7 @@ void stepWater(
+     run.mWeight = vec3(shares.mWhole) + shares.mThrough * under.mTransmittance;
+     run.mScattered = shares.mThrough * under.mScattered;
+     run.mShafts = shares.mThrough * shaftsOf(column);
++    applyRainSilt(run, shares);
+     run.mStep = RUN_IDLE;
+ }
+ 
+diff --git a/components/rtxvulkan/shaders/trace/bounce.comp b/components/rtxvulkan/shaders/trace/bounce.comp
+index 7656ad43..852f769d 100644
+--- a/components/rtxvulkan/shaders/trace/bounce.comp
++++ b/components/rtxvulkan/shaders/trace/bounce.comp
+@@ -15,6 +15,7 @@
+ // **The trace's hit, resolved again with no traversal** (`storedSolidOf`): the surface the trace shaded, to
+ // the bit.
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git a/components/rtxvulkan/shaders/trace/direct.comp b/components/rtxvulkan/shaders/trace/direct.comp
+index 3483f94f..035d0caf 100644
+--- a/components/rtxvulkan/shaders/trace/direct.comp
++++ b/components/rtxvulkan/shaders/trace/direct.comp
+@@ -13,6 +13,7 @@
+ // Runs before the layers' stage (`panes.comp`), so the solid's light stands behind them; what the layers let
+ // through is the throughput's fourth, which this stage leaves off but for the lift.
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "gbuffer.h"
+diff --git a/components/rtxvulkan/shaders/trace/fogdepth.rgen b/components/rtxvulkan/shaders/trace/fogdepth.rgen
+index 5ff7cad6..600f9980 100644
+--- a/components/rtxvulkan/shaders/trace/fogdepth.rgen
++++ b/components/rtxvulkan/shaders/trace/fogdepth.rgen
+@@ -50,7 +50,11 @@ void main()
+ 
+     // **And what each moon puts into this column's air**, which is the ray's angle to the moon and
+     // nothing along the ray — so it is this pass's to state once, and not every froxel's.
++    // The surface passes read the pond controls after the column-write barrier.
++    vec2 pond = vec2(0.0);
++    if (column == ivec2(0) && !isinf(frame.mWaterLevel))
++        pond = readPondMarker();
+     const MoonTerms terms = fogMoonTermsAlong(ray.mDirection);
+-    RTX_STORE_COUNTED(fogColumnMoons, ivec3(column, 0), vec4(terms.mMasser, 0.0))
+-    RTX_STORE_COUNTED(fogColumnMoons, ivec3(column, 1), vec4(terms.mSecunda, 0.0))
++    RTX_STORE_COUNTED(fogColumnMoons, ivec3(column, 0), vec4(terms.mMasser, pond.x))
++    RTX_STORE_COUNTED(fogColumnMoons, ivec3(column, 1), vec4(terms.mSecunda, pond.y))
+ }
+diff --git a/components/rtxvulkan/shaders/trace/landing.comp b/components/rtxvulkan/shaders/trace/landing.comp
+index d2c58af4..e01990db 100644
+--- a/components/rtxvulkan/shaders/trace/landing.comp
++++ b/components/rtxvulkan/shaders/trace/landing.comp
+@@ -10,6 +10,7 @@
+ // (`storeBounced`). A stage apart from the bounce (`BounceRun`), so no record of the bounce's is live through
+ // the landing's traversals.
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git a/components/rtxvulkan/shaders/trace/media.comp b/components/rtxvulkan/shaders/trace/media.comp
+index e65427a2..fbd5e90a 100644
+--- a/components/rtxvulkan/shaders/trace/media.comp
++++ b/components/rtxvulkan/shaders/trace/media.comp
+@@ -12,6 +12,7 @@
+ // with no shaft in it runs no wave of this stage. Before the layers' stage (`panes.comp`), so the light
+ // behind them is whole. The trace's rays again, not its columns stored.
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git a/components/rtxvulkan/shaders/trace/panes.comp b/components/rtxvulkan/shaders/trace/panes.comp
+index ecaac641..c50f878c 100644
+--- a/components/rtxvulkan/shaders/trace/panes.comp
++++ b/components/rtxvulkan/shaders/trace/panes.comp
+@@ -11,6 +11,7 @@
+ // order"). The trace's rays again, not its layers stored: the peel walks the trace's own steps (`Peel`), over
+ // the tiles the trace listed alone (`STAGE_LIST_PANES`).
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git a/components/rtxvulkan/shaders/trace/unbounced.comp b/components/rtxvulkan/shaders/trace/unbounced.comp
+index 6208da61..40a8ff14 100644
+--- a/components/rtxvulkan/shaders/trace/unbounced.comp
++++ b/components/rtxvulkan/shaders/trace/unbounced.comp
+@@ -9,6 +9,7 @@
+ // path through `bounce.comp`: a surface read only for its position and normals leaves every other fetch of
+ // `resolve` to the compiler to remove, and no list, gloss or lobe holds registers.
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "scene.h"
+diff --git a/components/rtxvulkan/shaders/trace/visibility.comp b/components/rtxvulkan/shaders/trace/visibility.comp
+index 170a856d..8aa1a460 100644
+--- a/components/rtxvulkan/shaders/trace/visibility.comp
++++ b/components/rtxvulkan/shaders/trace/visibility.comp
+@@ -15,6 +15,7 @@
+ // lists its every other tile under the class of its solids and of its layers (`STAGE_LIST_SOLID`,
+ // `STAGE_LIST_PANES`).
+ 
++#define POND_FRAME_READY
+ #include "shared/traceconstants.h"
+ #include "camera.h"
+ #include "shared/glare.h"
+diff --git a/components/rtxvulkan/trace/fogvolume.cpp b/components/rtxvulkan/trace/fogvolume.cpp
+index f6f56e33..5917f074 100644
+--- a/components/rtxvulkan/trace/fogvolume.cpp
++++ b/components/rtxvulkan/trace/fogvolume.cpp
+@@ -304,11 +304,10 @@ namespace Rtx
+ 
+     void FogVolume::depthTaken(VkCommandBuffer commands) const
+     {
+-        // The depth is loaded by the scatter launch, by the integrate dispatch and by the trace,
+-        // so the one hand-over names both stages; the moons by the scatter launch alone.
++        // Depth and the pond controls are read by both the ray-tracing and compute stages.
+         Barriers barriers(commands);
+         mColumnDepth.addTransition(barriers, Use::sTraceWrite, Use::sShaderStorageRead);
+-        mColumnMoons.addTransition(barriers, Use::sTraceWrite, Use::sTraceRead);
++        mColumnMoons.addTransition(barriers, Use::sTraceWrite, Use::sShaderStorageRead);
+         barriers.flush();
+     }
+ 
